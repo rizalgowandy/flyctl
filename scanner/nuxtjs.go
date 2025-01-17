@@ -1,7 +1,7 @@
 package scanner
 
-func configureNuxt(sourceDir string) (*SourceInfo, error) {
-	if !checksPass(sourceDir, fileExists("nuxt.config.js")) {
+func configureNuxt(sourceDir string, config *ScannerConfig) (*SourceInfo, error) {
+	if !checksPass(sourceDir, fileExists("nuxt.config.ts")) {
 		return nil, nil
 	}
 
@@ -13,7 +13,7 @@ func configureNuxt(sourceDir string) (*SourceInfo, error) {
 		Family:       "NuxtJS",
 		Port:         8080,
 		SkipDatabase: true,
-		Env: env,
+		Env:          env,
 	}
 
 	s.Files = templates("templates/nuxtjs")

@@ -4,18 +4,23 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
+	"time"
 
-	"github.com/AlecAivazis/survey/v2"
+	"github.com/docker/docker/pkg/ioutils"
+	"github.com/mattn/go-colorable"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/spf13/cobra"
-
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/fly-go/flaps"
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/flaps"
-	"github.com/superfly/flyctl/internal/app"
+	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/flyutil"
+	"github.com/superfly/flyctl/internal/prompt"
 	"github.com/superfly/flyctl/internal/sentry"
 	"github.com/superfly/flyctl/iostreams"
 	"github.com/superfly/flyctl/ip"
@@ -34,17 +39,18 @@ func stdArgsSSH(cmd *cobra.Command) {
 			Default:     "",
 			Description: "command to run on SSH session",
 		},
+		flag.String{
+			Name:        "machine",
+			Default:     "",
+			Description: "Run the console in the existing machine with the specified ID",
+		},
 		flag.Bool{
 			Name:        "select",
 			Shorthand:   "s",
 			Default:     false,
 			Description: "select available instances",
 		},
-		flag.String{
-			Name:        "region",
-			Shorthand:   "r",
-			Description: "Region to create WireGuard connection in",
-		},
+		flag.Region(),
 		flag.Bool{
 			Name:        "quiet",
 			Shorthand:   "q",
@@ -55,6 +61,17 @@ func stdArgsSSH(cmd *cobra.Command) {
 			Shorthand:   "A",
 			Description: "Address of VM to connect to",
 		},
+		flag.Bool{
+			Name:        "pty",
+			Description: "Allocate a pseudo-terminal (default: on when no command is provided)",
+		},
+		flag.String{
+			Name:        "user",
+			Shorthand:   "u",
+			Description: "Unix username to connect as",
+			Default:     DefaultSshUsername,
+		},
+		flag.ProcessGroup(""),
 	)
 }
 
@@ -62,21 +79,16 @@ func quiet(ctx context.Context) bool {
 	return flag.GetBool(ctx, "quiet")
 }
 
-func lookupAddress(ctx context.Context, cli *agent.Client, dialer agent.Dialer, app *api.AppCompact, console bool) (addr string, err error) {
-	if app.PlatformVersion == "machines" {
-		addr, err = addrForMachines(ctx, app, console)
-	} else {
-		addr, err = addrForNomad(ctx, cli, app, console)
-	}
-
+func lookupAddress(ctx context.Context, cli *agent.Client, dialer agent.Dialer, app *fly.AppCompact, console bool) (addr string, err error) {
+	addr, err = addrForMachines(ctx, app, console)
 	if err != nil {
 		return
 	}
 
 	// wait for the addr to be resolved in dns unless it's an ip address
 	if !ip.IsV6(addr) {
-		if err := cli.WaitForDNS(ctx, dialer, app.Organization.Slug, addr); err != nil {
-			captureError(err, app)
+		if err := cli.WaitForDNS(ctx, dialer, app.Organization.Slug, addr, ""); err != nil {
+			captureError(ctx, err, app)
 			return "", errors.Wrapf(err, "host unavailable at %s", addr)
 		}
 	}
@@ -91,7 +103,7 @@ func newConsole() *cobra.Command {
 		usage = "console"
 	)
 
-	cmd := command.New(usage, short, long, runConsole, command.RequireSession, command.LoadAppNameIfPresent)
+	cmd := command.New(usage, short, long, runConsole, command.RequireSession, command.RequireAppName)
 
 	cmd.Args = cobra.MaximumNArgs(1)
 
@@ -100,15 +112,16 @@ func newConsole() *cobra.Command {
 	return cmd
 }
 
-func captureError(err error, app *api.AppCompact) {
+func captureError(ctx context.Context, err error, app *fly.AppCompact) {
 	// ignore cancelled errors
 	if errors.Is(err, context.Canceled) {
 		return
 	}
 
 	sentry.CaptureException(err,
+		sentry.WithTraceID(ctx),
 		sentry.WithTag("feature", "ssh-console"),
-		sentry.WithContexts(map[string]interface{}{
+		sentry.WithContexts(map[string]sentry.Context{
 			"app": map[string]interface{}{
 				"name": app.Name,
 			},
@@ -119,38 +132,9 @@ func captureError(err error, app *api.AppCompact) {
 	)
 }
 
-func bringUp(ctx context.Context, client *api.Client, app *api.AppCompact) (*agent.Client, agent.Dialer, error) {
-	io := iostreams.FromContext(ctx)
-
-	agentclient, err := agent.Establish(ctx, client)
-	if err != nil {
-		captureError(err, app)
-		return nil, nil, errors.Wrap(err, "can't establish agent")
-	}
-
-	dialer, err := agentclient.Dialer(ctx, app.Organization.Slug)
-	if err != nil {
-		captureError(err, app)
-		return nil, nil, fmt.Errorf("ssh: can't build tunnel for %s: %s\n", app.Organization.Slug, err)
-	}
-
-	if !quiet(ctx) {
-		io.StartProgressIndicatorMsg("Connecting to tunnel")
-	}
-	if err := agentclient.WaitForTunnel(ctx, app.Organization.Slug); err != nil {
-		captureError(err, app)
-		return nil, nil, errors.Wrapf(err, "tunnel unavailable")
-	}
-	if !quiet(ctx) {
-		io.StopProgressIndicator()
-	}
-
-	return agentclient, dialer, nil
-}
-
 func runConsole(ctx context.Context) error {
-	client := client.FromContext(ctx).API()
-	appName := app.NameFromContext(ctx)
+	client := flyutil.ClientFromContext(ctx)
+	appName := appconfig.NameFromContext(ctx)
 
 	if !quiet(ctx) {
 		terminal.Debugf("Retrieving app info for %s\n", appName)
@@ -161,7 +145,12 @@ func runConsole(ctx context.Context) error {
 		return fmt.Errorf("get app: %w", err)
 	}
 
-	agentclient, dialer, err := bringUp(ctx, client, app)
+	network, err := client.GetAppNetwork(ctx, app.Name)
+	if err != nil {
+		return fmt.Errorf("get app network: %w", err)
+	}
+
+	agentclient, dialer, err := BringUpAgent(ctx, client, app, *network, quiet(ctx))
 	if err != nil {
 		return err
 	}
@@ -171,93 +160,73 @@ func runConsole(ctx context.Context) error {
 		return err
 	}
 
-	// BUG(tqbf): many of these are no longer really params
-	params := &SSHParams{
-		Ctx:    ctx,
-		Org:    app.Organization,
-		Dialer: dialer,
-		App:    appName,
-		Cmd:    flag.GetString(ctx, "command"),
-		Stdin:  os.Stdin,
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+	// TODO: eventually remove the exception for sh and bash.
+	cmd := flag.GetString(ctx, "command")
+	allocPTY := cmd == "" || flag.GetBool(ctx, "pty")
+	if !allocPTY && (cmd == "sh" || cmd == "/bin/sh" || cmd == "bash" || cmd == "/bin/bash") {
+		terminal.Warn(
+			"Allocating a pseudo-terminal since the command provided is a shell. " +
+				"This behavior will change in the future; please use --pty explicitly if this is what you want.",
+		)
+		allocPTY = true
 	}
 
-	if quiet(ctx) {
-		params.DisableSpinner = true
+	params := &ConnectParams{
+		Ctx:            ctx,
+		Org:            app.Organization,
+		Dialer:         dialer,
+		Username:       flag.GetString(ctx, "user"),
+		DisableSpinner: quiet(ctx),
+		AppNames:       []string{app.Name},
 	}
-
-	sshc, err := sshConnect(params, addr)
+	sshc, err := Connect(params, addr)
 	if err != nil {
-		captureError(err, app)
+		captureError(ctx, err, app)
 		return err
 	}
 
-	term := &ssh.Terminal{
-		Stdin:  params.Stdin,
-		Stdout: params.Stdout,
-		Stderr: params.Stderr,
-		Mode:   "xterm",
+	if err := Console(ctx, sshc, cmd, allocPTY); err != nil {
+		captureError(ctx, err, app)
+		return err
 	}
 
-	if err := sshc.Shell(params.Ctx, term, params.Cmd); err != nil {
-		captureError(err, app)
+	return nil
+}
+
+func Console(ctx context.Context, sshClient *ssh.Client, cmd string, allocPTY bool) error {
+	currentStdin, currentStdout, currentStderr, err := setupConsole()
+	defer func() error {
+		if err := cleanupConsole(currentStdin, currentStdout, currentStderr); err != nil {
+			return err
+		}
+		return nil
+	}()
+
+	sessIO := &ssh.SessionIO{
+		Stdin: os.Stdin,
+		// "colorable" package should be used after the console setup performed above.
+		// Otherwise, virtual terminal emulation provided by the package will break UTF-8 encoding.
+		// If flyctl targets Windows 10+ only then we can avoid using this package at all
+		// because Windows 10+ already provides virtual terminal support.
+		Stdout:   ioutils.NewWriteCloserWrapper(colorable.NewColorableStdout(), func() error { return nil }),
+		Stderr:   ioutils.NewWriteCloserWrapper(colorable.NewColorableStderr(), func() error { return nil }),
+		AllocPTY: allocPTY,
+		TermEnv:  determineTermEnv(),
+	}
+
+	if err := sshClient.Shell(ctx, sessIO, cmd); err != nil {
 		return errors.Wrap(err, "ssh shell")
 	}
 
 	return err
 }
 
-func sshConnect(p *SSHParams, addr string) (*ssh.Client, error) {
-	terminal.Debugf("Fetching certificate for %s\n", addr)
-
-	cert, err := singleUseSSHCertificate(p.Ctx, p.Org)
-	if err != nil {
-		return nil, fmt.Errorf("create ssh certificate: %w (if you haven't created a key for your org yet, try `flyctl ssh establish`)", err)
-	}
-
-	pk, err := parsePrivateKey(cert.Key)
-	if err != nil {
-		return nil, errors.Wrap(err, "parse ssh certificate")
-	}
-
-	pemkey := marshalED25519PrivateKey(pk, "single-use certificate")
-
-	terminal.Debugf("Keys for %s configured; connecting...\n", addr)
-
-	sshClient := &ssh.Client{
-		Addr: addr + ":22",
-		User: "root",
-
-		Dial: p.Dialer.DialContext,
-
-		Certificate: cert.Certificate,
-		PrivateKey:  string(pemkey),
-	}
-
-	var endSpin context.CancelFunc
-	if !p.DisableSpinner {
-		endSpin = spin(fmt.Sprintf("Connecting to %s...", addr),
-			fmt.Sprintf("Connecting to %s... complete\n", addr))
-		defer endSpin()
-	}
-
-	if err := sshClient.Connect(p.Ctx); err != nil {
-		return nil, errors.Wrap(err, "error connecting to SSH server")
-	}
-
-	terminal.Debugf("Connection completed.\n", addr)
-
-	if !p.DisableSpinner {
-		endSpin()
-	}
-
-	return sshClient, nil
-}
-
-func addrForMachines(ctx context.Context, app *api.AppCompact, console bool) (addr string, err error) {
+func addrForMachines(ctx context.Context, app *fly.AppCompact, console bool) (addr string, err error) {
 	out := iostreams.FromContext(ctx).Out
-	flapsClient, err := flaps.New(ctx, app)
+	flapsClient, err := flapsutil.NewClientWithOptions(ctx, flaps.NewClientOpts{
+		AppCompact: app,
+		AppName:    app.Name,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -267,45 +236,88 @@ func addrForMachines(ctx context.Context, app *api.AppCompact, console bool) (ad
 		return "", err
 	}
 
+	machines = lo.Filter(machines, func(m *fly.Machine, _ int) bool {
+		return m.State == "started"
+	})
+
 	if len(machines) < 1 {
-		return "", fmt.Errorf("app %s has no started or stopped VMs", app.Name)
+		return "", fmt.Errorf("app %s has no started VMs.\nIt may be unhealthy or not have been deployed yet.\nTry the following command to verify:\n\nfly status", app.Name)
 	}
 
-	if err != nil {
-		return "", err
+	if region := flag.GetRegion(ctx); region != "" {
+		machines = lo.Filter(machines, func(m *fly.Machine, _ int) bool {
+			return m.Region == region
+		})
+		if len(machines) < 1 {
+			return "", fmt.Errorf("app %s has no VMs in region %s", app.Name, region)
+		}
+	}
+
+	if group := flag.GetProcessGroup(ctx); group != "" {
+		machines = lo.Filter(machines, func(m *fly.Machine, _ int) bool {
+			return m.ProcessGroup() == group
+		})
+		if len(machines) < 1 {
+			return "", fmt.Errorf("app %s has no VMs in process group %s", app.Name, group)
+		}
 	}
 
 	var namesWithRegion []string
-	var selectedMachine *api.Machine
+	machineID := flag.GetString(ctx, "machine")
+	var selectedMachine *fly.Machine
+	multipleGroups := len(lo.UniqBy(machines, func(m *fly.Machine) string { return m.ProcessGroup() })) > 1
 
 	for _, machine := range machines {
-		namesWithRegion = append(namesWithRegion, fmt.Sprintf("%s: %s %s %s", machine.Region, machine.ID, machine.PrivateIP, machine.Name))
+		if machine.ID == machineID {
+			selectedMachine = machine
+		}
+
+		nameWithRegion := fmt.Sprintf("%s: %s %s %s", machine.Region, machine.ID, machine.PrivateIP, machine.Name)
+
+		role := ""
+		for _, check := range machine.Checks {
+			if check.Name == "role" {
+				if check.Status == fly.Passing {
+					role = check.Output
+				} else {
+					role = "error"
+				}
+			}
+		}
+
+		if role != "" {
+			nameWithRegion += fmt.Sprintf(" (%s)", role)
+		}
+
+		if multipleGroups {
+			nameWithRegion += fmt.Sprintf(" (%s)", machine.ProcessGroup())
+		}
+		namesWithRegion = append(namesWithRegion, nameWithRegion)
 	}
 
 	if flag.GetBool(ctx, "select") {
+		if flag.IsSpecified(ctx, "machine") {
+			return "", errors.New("--machine can't be used with -s/--select")
+		}
 
 		selected := 0
 
-		prompt := &survey.Select{
-			Message:  "Select VM:",
-			Options:  namesWithRegion,
-			PageSize: 15,
-		}
-
-		if err := survey.AskOne(prompt, &selected); err != nil {
+		if prompt.Select(ctx, &selected, "Select VM:", "", namesWithRegion...); err != nil {
 			return "", fmt.Errorf("selecting VM: %w", err)
 		}
 
 		selectedMachine = machines[selected]
+	}
 
+	if selectedMachine != nil {
 		if selectedMachine.State != "started" {
 			fmt.Fprintf(out, "Starting machine %s..", selectedMachine.ID)
-			_, err := flapsClient.Start(ctx, selectedMachine.ID)
+			_, err := flapsClient.Start(ctx, selectedMachine.ID, "")
 			if err != nil {
 				return "", err
 			}
 
-			err = flapsClient.Wait(ctx, selectedMachine, "started")
+			err = flapsClient.Wait(ctx, selectedMachine, "started", 60*time.Second)
 
 			if err != nil {
 				return "", err
@@ -328,41 +340,40 @@ func addrForMachines(ctx context.Context, app *api.AppCompact, console bool) (ad
 	}
 	// No VM was selected or passed as an argument, so just pick the first one for now
 	// Later, we might want to use 'nearest.of' but also resolve the machine IP to be able to start it
-	return fmt.Sprintf("[%s]", selectedMachine.PrivateIP), nil
+	return selectedMachine.PrivateIP, nil
 }
 
-func addrForNomad(ctx context.Context, agentclient *agent.Client, app *api.AppCompact, console bool) (addr string, err error) {
-	if flag.GetBool(ctx, "select") {
+const defaultTermEnv = "xterm"
 
-		instances, err := agentclient.Instances(ctx, app.Organization.Slug, app.Name)
-		if err != nil {
-			return "", fmt.Errorf("look up %s: %w", app.Name, err)
-		}
-
-		selected := 0
-		prompt := &survey.Select{
-			Message:  "Select instance:",
-			Options:  instances.Labels,
-			PageSize: 15,
-		}
-
-		if err := survey.AskOne(prompt, &selected); err != nil {
-			return "", fmt.Errorf("selecting instance: %w", err)
-		}
-
-		addr = fmt.Sprintf("[%s]", instances.Addresses[selected])
-		return addr, nil
+func determineTermEnv() string {
+	switch runtime.GOOS {
+	case "aix":
+		return determineTermEnvFromLocalEnv()
+	case "darwin":
+		return determineTermEnvFromLocalEnv()
+	case "dragonfly":
+		return determineTermEnvFromLocalEnv()
+	case "freebsd":
+		return determineTermEnvFromLocalEnv()
+	case "illumos":
+		return determineTermEnvFromLocalEnv()
+	case "linux":
+		return determineTermEnvFromLocalEnv()
+	case "netbsd":
+		return determineTermEnvFromLocalEnv()
+	case "openbsd":
+		return determineTermEnvFromLocalEnv()
+	case "solaris":
+		return determineTermEnvFromLocalEnv()
+	default:
+		return defaultTermEnv
 	}
+}
 
-	if addr = flag.GetString(ctx, "address"); addr != "" {
-		return addr, nil
+func determineTermEnvFromLocalEnv() string {
+	if term := os.Getenv("TERM"); term != "" {
+		return term
+	} else {
+		return defaultTermEnv
 	}
-
-	if console {
-		if len(flag.Args(ctx)) != 0 {
-			return flag.Args(ctx)[0], nil
-		}
-	}
-
-	return fmt.Sprintf("top1.nearest.of.%s.internal", app.Name), nil
 }

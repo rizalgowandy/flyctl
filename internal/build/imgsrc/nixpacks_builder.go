@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -18,6 +19,8 @@ import (
 	"github.com/superfly/flyctl/proxy"
 	"github.com/superfly/flyctl/terminal"
 )
+
+const nixpackInstallerURL string = "https://raw.githubusercontent.com/railwayapp/nixpacks/master/install.sh"
 
 type nixpacksBuilder struct{}
 
@@ -49,9 +52,14 @@ func ensureNixpacksBinary(ctx context.Context, streams *iostreams.IOStreams) err
 		if err != nil {
 			return err
 		}
-		defer out.Close()
+		defer func() {
+			err := out.Close()
+			if err != nil {
+				terminal.Debugf("error closing install.sh: %v", err)
+			}
+		}()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://raw.githubusercontent.com/railwayapp/nixpacks/master/install.sh", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nixpackInstallerURL, http.NoBody)
 		if err != nil {
 			return err
 		}
@@ -59,7 +67,7 @@ func ensureNixpacksBinary(ctx context.Context, streams *iostreams.IOStreams) err
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() // skipcq: GO-S2307
 
 		n, err := io.Copy(out, resp.Body)
 		if err != nil {
@@ -89,55 +97,66 @@ func ensureNixpacksBinary(ctx context.Context, streams *iostreams.IOStreams) err
 	return err
 }
 
-func (*nixpacksBuilder) Run(ctx context.Context, dockerFactory *dockerClientFactory, streams *iostreams.IOStreams, opts ImageOptions) (*DeploymentImage, error) {
+func (*nixpacksBuilder) Run(ctx context.Context, dockerFactory *dockerClientFactory, streams *iostreams.IOStreams, opts ImageOptions, build *build) (*DeploymentImage, string, error) {
+	build.BuildStart()
 	if !dockerFactory.mode.IsAvailable() {
-		terminal.Debug("docker daemon not available, skipping")
-		return nil, nil
+		note := "docker daemon not available, skipping"
+		terminal.Debug(note)
+		build.BuildFinish()
+		return nil, note, nil
 	}
 
 	if err := ensureNixpacksBinary(ctx, streams); err != nil {
-		return nil, errors.Wrap(err, "could not install nixpacks")
+		build.BuildFinish()
+		return nil, "", errors.Wrap(err, "could not install nixpacks")
 	}
 
-	docker, err := dockerFactory.buildFn(ctx)
+	build.BuilderInitStart()
+	docker, err := dockerFactory.buildFn(ctx, build)
 	if err != nil {
-		return nil, err
+		build.BuilderInitFinish()
+		build.BuildFinish()
+		return nil, "", err
 	}
+	defer docker.Close() // skipcq: GO-S2307
 
 	dockerHost := docker.DaemonHost()
 
 	if dockerFactory.IsRemote() {
 		agentclient, err := agent.Establish(ctx, dockerFactory.apiClient)
 		if err != nil {
-			return nil, err
+			build.BuilderInitFinish()
+			build.BuildFinish()
+			return nil, "", err
 		}
 
-		machine, app, err := remoteBuilderMachine(ctx, dockerFactory.apiClient, dockerFactory.appName)
+		machine, app, err := remoteBuilderMachine(ctx, dockerFactory.apiClient, dockerFactory.appName, false)
 		if err != nil {
-			return nil, err
+			build.BuilderInitFinish()
+			build.BuildFinish()
+			return nil, "", err
 		}
 
-		var remoteHost string
-		for _, ip := range machine.IPs.Nodes {
-			terminal.Debugf("checking ip %+v\n", ip)
-			if ip.Kind == "privatenet" {
-				remoteHost = ip.IP
-				break
-			}
-		}
+		remoteHost := machine.PrivateIP
 
 		if remoteHost == "" {
-			return nil, fmt.Errorf("could not find machine IP")
+			build.BuilderInitFinish()
+			build.BuildFinish()
+			return nil, "", fmt.Errorf("could not find machine IP")
 		}
 
-		dialer, err := agentclient.ConnectToTunnel(ctx, app.Organization.Slug)
+		dialer, err := agentclient.ConnectToTunnel(ctx, app.Organization.Slug, "", false)
 		if err != nil {
-			return nil, err
+			build.BuilderInitFinish()
+			build.BuildFinish()
+			return nil, "", err
 		}
 
 		tmpdir, err := os.MkdirTemp("", "")
 		if err != nil {
-			return nil, err
+			build.BuilderInitFinish()
+			build.BuildFinish()
+			return nil, "", err
 		}
 
 		defer os.RemoveAll(tmpdir)
@@ -157,7 +176,9 @@ func (*nixpacksBuilder) Run(ctx context.Context, dockerFactory *dockerClientFact
 
 		server, err := proxy.NewServer(ctx, params)
 		if err != nil {
-			return nil, err
+			build.BuilderInitFinish()
+			build.BuildFinish()
+			return nil, "", err
 		}
 
 		go server.ProxyServer(ctx)
@@ -165,11 +186,18 @@ func (*nixpacksBuilder) Run(ctx context.Context, dockerFactory *dockerClientFact
 	}
 
 	defer clearDeploymentTags(ctx, docker, opts.Tag)
+	build.BuilderInitFinish()
 
+	build.ImageBuildStart()
 	confDir := flyctl.ConfigDir()
 	nixpacksPath := filepath.Join(confDir, "bin", "nixpacks")
 
 	nixpacksArgs := []string{"build", "--name", opts.Tag, opts.WorkingDir}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "NIXPACKS_") {
+			nixpacksArgs = append(nixpacksArgs, "--env", kv)
+		}
+	}
 
 	terminal.Debugf("calling nixpacks at %s with args: %v and docker host: %s", nixpacksPath, nixpacksArgs, dockerHost)
 
@@ -180,21 +208,31 @@ func (*nixpacksBuilder) Run(ctx context.Context, dockerFactory *dockerClientFact
 	cmd.Stdin = nil
 
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		build.ImageBuildFinish()
+		build.BuildFinish()
+		return nil, "", err
 	}
+	build.ImageBuildFinish()
+	build.BuildFinish()
 
+	build.PushStart()
 	if err := pushToFly(ctx, docker, streams, opts.Tag); err != nil {
-		return nil, err
+		build.PushFinish()
+		return nil, "", err
 	}
+	build.PushFinish()
 
 	img, err := findImageWithDocker(ctx, docker, opts.Tag)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	if img == nil {
+		return nil, "", fmt.Errorf("no image found")
 	}
 
 	return &DeploymentImage{
 		ID:   img.ID,
 		Tag:  opts.Tag,
 		Size: img.Size,
-	}, nil
+	}, "", nil
 }

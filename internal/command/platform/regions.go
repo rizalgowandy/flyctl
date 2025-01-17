@@ -6,14 +6,20 @@ import (
 	"sort"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/exp/slices"
 
 	"github.com/superfly/flyctl/iostreams"
 
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/config"
+	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/render"
 )
+
+// Hardcoded list of regions with GPUs
+// TODO: fetch this list from the graphql endpoint once it is there
+var gpuRegions = []string{"iad", "sjc", "syd", "ams"}
 
 func newRegions() (cmd *cobra.Command) {
 	const (
@@ -27,19 +33,19 @@ func newRegions() (cmd *cobra.Command) {
 	)
 
 	cmd.Args = cobra.NoArgs
-
+	flag.Add(cmd, flag.JSONOutput())
 	return
 }
 
 func runRegions(ctx context.Context) error {
-	client := client.FromContext(ctx).API()
+	client := flyutil.ClientFromContext(ctx)
 
 	regions, _, err := client.PlatformRegions(ctx)
 	if err != nil {
 		return fmt.Errorf("failed retrieving regions: %w", err)
 	}
 	sort.Slice(regions, func(i, j int) bool {
-		return regions[i].Code < regions[j].Code
+		return regions[i].Name < regions[j].Name
 	})
 
 	out := iostreams.FromContext(ctx).Out
@@ -53,13 +59,23 @@ func runRegions(ctx context.Context) error {
 		if region.GatewayAvailable {
 			gateway = "✓"
 		}
+		paidPlan := ""
+		if region.RequiresPaidPlan {
+			paidPlan = "✓"
+		}
+		gpuAvailable := ""
+		if slices.Contains(gpuRegions, region.Code) {
+			gpuAvailable = "✓"
+		}
 
 		rows = append(rows, []string{
-			region.Code,
 			region.Name,
+			region.Code,
 			gateway,
+			paidPlan,
+			gpuAvailable,
 		})
 	}
 
-	return render.Table(out, "", rows, "Code", "Name", "Gateway")
+	return render.Table(out, "", rows, "Name", "Code", "Gateway", "Launch Plan + Only", "GPUs")
 }

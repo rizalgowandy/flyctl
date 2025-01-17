@@ -1,18 +1,16 @@
 package machine
 
 import (
-	"context"
-
 	"github.com/spf13/cobra"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/command"
 )
 
 func New() *cobra.Command {
 	const (
-		short = "Commands that manage machines"
-		long  = short + "\n"
+		short = "Manage Fly Machines."
+		long  = short + ` Fly Machines are super-fast, lightweight VMs that can be created,
+and then quickly started and stopped as needed with flyctl commands or with the
+Machines REST fly.`
 		usage = "machine <command>"
 	)
 
@@ -25,33 +23,23 @@ func New() *cobra.Command {
 	cmd.AddCommand(
 		newKill(),
 		newList(),
-		newRemove(),
+		newDestroy(),
 		newRun(),
+		newCreate(),
 		newStart(),
 		newStop(),
 		newStatus(),
 		newProxy(),
-		newLaunch(),
 		newClone(),
 		newUpdate(),
 		newRestart(),
+		newLeases(),
+		newMachineExec(),
+		newMachineCordon(),
+		newMachineUncordon(),
+		newSuspend(),
+		newEgressIp(),
 	)
 
 	return cmd
-}
-
-func appFromMachineOrName(ctx context.Context, machineId string, appName string) (app *api.AppCompact, err error) {
-	client := client.FromContext(ctx).API()
-
-	if appName == "" {
-		machine, err := client.GetMachine(ctx, machineId)
-		if err != nil {
-			return nil, err
-		}
-		app = machine.App
-	} else {
-		app, err = client.GetAppCompact(ctx, appName)
-	}
-
-	return app, err
 }

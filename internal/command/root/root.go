@@ -2,31 +2,49 @@
 package root
 
 import (
+	"context"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/kr/text"
+	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/cmd"
 	"github.com/superfly/flyctl/flyctl"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/command/agent"
 	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/command/auth"
+	"github.com/superfly/flyctl/internal/command/certificates"
 	"github.com/superfly/flyctl/internal/command/checks"
+	"github.com/superfly/flyctl/internal/command/config"
+	"github.com/superfly/flyctl/internal/command/console"
+	"github.com/superfly/flyctl/internal/command/consul"
 	"github.com/superfly/flyctl/internal/command/create"
 	"github.com/superfly/flyctl/internal/command/curl"
+	"github.com/superfly/flyctl/internal/command/dashboard"
 	"github.com/superfly/flyctl/internal/command/deploy"
 	"github.com/superfly/flyctl/internal/command/destroy"
 	"github.com/superfly/flyctl/internal/command/dig"
+	"github.com/superfly/flyctl/internal/command/dnsrecords"
 	"github.com/superfly/flyctl/internal/command/docs"
 	"github.com/superfly/flyctl/internal/command/doctor"
-	"github.com/superfly/flyctl/internal/command/help"
+	"github.com/superfly/flyctl/internal/command/domains"
+	"github.com/superfly/flyctl/internal/command/extensions"
 	"github.com/superfly/flyctl/internal/command/history"
 	"github.com/superfly/flyctl/internal/command/image"
+	"github.com/superfly/flyctl/internal/command/incidents"
+	"github.com/superfly/flyctl/internal/command/info"
 	"github.com/superfly/flyctl/internal/command/ips"
+	"github.com/superfly/flyctl/internal/command/jobs"
+	"github.com/superfly/flyctl/internal/command/launch"
+	"github.com/superfly/flyctl/internal/command/lfsc"
 	"github.com/superfly/flyctl/internal/command/logs"
 	"github.com/superfly/flyctl/internal/command/machine"
-	"github.com/superfly/flyctl/internal/command/monitor"
+	"github.com/superfly/flyctl/internal/command/metrics"
 	"github.com/superfly/flyctl/internal/command/move"
+	"github.com/superfly/flyctl/internal/command/mysql"
 	"github.com/superfly/flyctl/internal/command/open"
 	"github.com/superfly/flyctl/internal/command/orgs"
 	"github.com/superfly/flyctl/internal/command/ping"
@@ -34,183 +52,201 @@ import (
 	"github.com/superfly/flyctl/internal/command/postgres"
 	"github.com/superfly/flyctl/internal/command/proxy"
 	"github.com/superfly/flyctl/internal/command/redis"
+	"github.com/superfly/flyctl/internal/command/regions"
+	"github.com/superfly/flyctl/internal/command/registry"
 	"github.com/superfly/flyctl/internal/command/releases"
-	"github.com/superfly/flyctl/internal/command/restart"
 	"github.com/superfly/flyctl/internal/command/resume"
+	"github.com/superfly/flyctl/internal/command/scale"
 	"github.com/superfly/flyctl/internal/command/secrets"
+	"github.com/superfly/flyctl/internal/command/services"
+	"github.com/superfly/flyctl/internal/command/settings"
 	"github.com/superfly/flyctl/internal/command/ssh"
 	"github.com/superfly/flyctl/internal/command/status"
+	"github.com/superfly/flyctl/internal/command/storage"
 	"github.com/superfly/flyctl/internal/command/suspend"
+	"github.com/superfly/flyctl/internal/command/synthetics"
+	"github.com/superfly/flyctl/internal/command/tokens"
 	"github.com/superfly/flyctl/internal/command/version"
-	"github.com/superfly/flyctl/internal/command/vm"
 	"github.com/superfly/flyctl/internal/command/volumes"
+	"github.com/superfly/flyctl/internal/command/wireguard"
+	"github.com/superfly/flyctl/internal/flag/flagnames"
+	"github.com/superfly/flyctl/internal/flyutil"
 )
 
 // New initializes and returns a reference to a new root command.
 func New() *cobra.Command {
-	/*
-			const (
-				long = `flyctl is a command line interface to the Fly.io platform.
+	const (
+		long  = `This is flyctl, the Fly.io command line interface.`
+		short = "The Fly.io command line interface"
+	)
 
-		It allows users to manage authentication, application launch,
-		deployment, network configuration, logging and more with just the
-		one command.
+	exePath, err := os.Executable()
+	var exe string
+	if err != nil {
+		log.Printf("WARN: failed to find executable, error=%q", err)
+		exe = "fly"
+	} else {
+		exe = filepath.Base(exePath)
+	}
 
-		Launch an app with the launch command
-		Deploy an app with the deploy command
-		View a deployed web application with the open command
-		Check the status of an application with the status command
+	root := command.New(exe, short, long, run)
+	root.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		cmd.SilenceUsage = true
+		cmd.SilenceErrors = true
+	}
 
-		To read more, use the docs command to view Fly's help on the web.
-		`
-				short = "The Fly CLI"
-				usage = "flyctl"
-			)
-
-			root := command.New(usage, short, long, nil)
-			root.SilenceUsage = true
-			root.SilenceErrors = true
-
-			fs := root.PersistentFlags()
-
-			_ = fs.StringP(flag.AccessTokenName, "t", "", "Fly API Access Token")
-			_ = fs.BoolP(flag.JSONOutputName, "j", false, "JSON output")
-			_ = fs.BoolP(flag.VerboseName, "v", false, "Verbose output")
-
-			root.AddCommand(
-				version.New(),
-				apps.New(),
-				create.New(),  // TODO: deprecate
-				destroy.New(), // TODO: deprecate
-				move.New(),    // TODO: deprecate
-				suspend.New(), // TODO: deprecate
-				resume.New(),  // TODO: deprecate
-				restart.New(), // TODO: deprecate
-				orgs.New(),
-				auth.New(),
-				builds.New(),
-				open.New(), // TODO: deprecate
-				curl.New(),
-				platform.New(),
-				docs.New(),
-				releases.New(),
-				deploy.New(),
-				history.New(),
-				status.New(),
-				logs.New(),
-				doctor.New(),
-				dig.New(),
-				volumes.New(),
-				agent.New(),
-			)
-
-			if os.Getenv("DEV") != "" {
-				root.AddCommand(services.New())
-			}
-
-			return root
-	*/
+	fs := root.PersistentFlags()
+	_ = fs.StringP(flagnames.AccessToken, "t", "", "Fly API Access Token")
+	_ = fs.BoolP(flagnames.Verbose, "", false, "Verbose output")
+	_ = fs.BoolP(flagnames.Debug, "", false, "Print additional logs and traces")
 
 	flyctl.InitConfig()
 
-	// what follows is a hack in order to achieve compatibility with what exists
-	// already. the commented out code above, is what should remain after the
-	// migration is complete.
-
-	// newCommands is the set of commands which work with the new way
-	newCommands := []*cobra.Command{
+	root.AddCommand(
+		group(apps.New(), "deploy"),
+		group(machine.New(), "deploy"),
 		version.New(),
-		apps.New(),
-		create.New(),  // TODO: deprecate
-		destroy.New(), // TODO: deprecate
-		move.New(),    // TODO: deprecate
-		suspend.New(), // TODO: deprecate
-		resume.New(),  // TODO: deprecate
-		restart.New(), // TODO: deprecate
-		orgs.New(),
-		auth.New(),
-		open.New(), // TODO: deprecate
-		curl.New(),
-		platform.New(),
-		docs.New(),
-		releases.New(),
-		deploy.New(),
-		history.New(),
-		status.New(),
-		logs.New(),
-		doctor.New(),
-		dig.New(),
-		volumes.New(),
+		group(orgs.New(), "acl"),
+		group(auth.New(), "acl"),
+		group(platform.New(), "more_help"),
+		group(docs.New(), "more_help"),
+		group(releases.New(), "upkeep"),
+		group(deploy.New().Command, "deploy"),
+		group(history.New(), "upkeep"),
+		group(status.New(), "deploy"),
+		group(logs.New(), "upkeep"),
+		group(doctor.New(), "more_help"),
+		group(dig.New(), "upkeep"),
+		group(volumes.New(), "configuring"),
+		group(lfsc.New(), "dbs_and_extensions"),
 		agent.New(),
-		image.New(),
-		ping.New(),
-		proxy.New(),
-		machine.New(),
-		monitor.New(),
-		postgres.New(),
-		ips.New(),
-		secrets.New(),
-		ssh.New(),
-		ssh.NewSFTP(),
-		redis.New(),
-		vm.New(),
-		checks.New(),
-	}
+		group(image.New(), "configuring"),
+		group(incidents.New(), "upkeep"),
+		group(mysql.New(), "dbs_and_extensions"),
+		group(ping.New(), "upkeep"),
+		group(proxy.New(), "upkeep"),
+		group(postgres.New(), "dbs_and_extensions"),
+		group(ips.New(), "configuring"),
+		group(secrets.New(), "configuring"),
+		group(ssh.New(), "upkeep"),
+		group(ssh.NewSFTP(), "upkeep"),
+		group(redis.New(), "dbs_and_extensions"),
+		group(registry.New(), "upkeep"),
+		group(checks.New(), "upkeep"),
+		group(launch.New(), "deploy"),
+		group(info.New(), "upkeep"),
+		jobs.New(),
+		group(services.New(), "upkeep"),
+		group(config.New(), "configuring"),
+		group(scale.New(), "configuring"),
+		group(tokens.New(), "acl"),
+		group(extensions.New(), "dbs_and_extensions"),
+		group(consul.New(), "dbs_and_extensions"),
+		group(certificates.New(), "configuring"),
+		group(dashboard.New(), "upkeep"),
+		group(wireguard.New(), "upkeep"),
+		group(console.New(), "upkeep"),
+		settings.New(),
+		group(storage.New(), "dbs_and_extensions"),
+		metrics.New(),
+		synthetics.New(),
+		curl.New(),       // TODO: deprecate
+		domains.New(),    // TODO: deprecate
+		open.New(),       // TODO: deprecate
+		create.New(),     // TODO: deprecate
+		destroy.New(),    // TODO: deprecate
+		move.New(),       // TODO: deprecate
+		suspend.New(),    // TODO: deprecate
+		resume.New(),     // TODO: deprecate
+		dnsrecords.New(), // TODO: deprecate
+
+		regions.New(), // TODO: deprecate
+	)
 
 	// if os.Getenv("DEV") != "" {
 	// 	newCommands = append(newCommands, services.New())
 	// }
 
-	// newCommandNames is the set of the names of the above commands
-	newCommandNames := make(map[string]struct{}, len(newCommands))
-	for _, cmd := range newCommands {
-		newCommandNames[cmd.Name()] = struct{}{}
-	}
+	// root.SetHelpCommand(help.New(root))
+	// root.RunE = help.NewRootHelp().RunE
 
-	// instead of root being constructed like in the commented out snippet, we
-	// rebuild it the old way.
-	root := cmd.NewRootCmd(client.New())
-
-	// gather the slice of commands which must be replaced with their new
-	// iterations
-	var commandsToReplace []*cobra.Command
-	for _, cmd := range root.Commands() {
-		if _, exists := newCommandNames[cmd.Name()]; exists {
-			commandsToReplace = append(commandsToReplace, cmd)
-		}
-	}
-
-	// remove them
-	root.RemoveCommand(commandsToReplace...)
-
-	// make sure the remaining old commands run the preparers
-	// TODO: remove when migration is done
-	wrapRunE(root)
-
-	// and finally, add the new commands
-	root.AddCommand(newCommands...)
-
-	root.SetHelpCommand(help.New(root))
-
-	root.RunE = help.NewRootHelp().RunE
+	root.AddGroup(&cobra.Group{
+		ID:    "deploy",
+		Title: "Deploying apps & machines",
+	})
+	root.AddGroup(&cobra.Group{
+		ID:    "configuring",
+		Title: "Configuration & scaling",
+	})
+	root.AddGroup(&cobra.Group{
+		ID:    "upkeep",
+		Title: "Monitoring & managing things",
+	})
+	root.AddGroup(&cobra.Group{
+		ID:    "dbs_and_extensions",
+		Title: "Databases & extensions",
+	})
+	root.AddGroup(&cobra.Group{
+		ID:    "acl",
+		Title: "Access control",
+	})
+	root.AddGroup(&cobra.Group{
+		ID:    "more_help",
+		Title: "Help & troubleshooting",
+	})
 
 	return root
 }
 
-func wrapRunE(cmd *cobra.Command) {
-	if cmd.HasAvailableSubCommands() {
-		for _, c := range cmd.Commands() {
-			wrapRunE(c)
+func run(ctx context.Context) error {
+	cmd := command.FromContext(ctx)
+
+	cmd.Println(cmd.Long)
+	cmd.Println()
+	cmd.Println("Usage:")
+	cmd.Printf("  %s\n", cmd.UseLine())
+	cmd.Printf("  %s\n", "flyctl [command]")
+	cmd.Println()
+
+	if !flyutil.ClientFromContext(ctx).Authenticated() {
+		msg := `It doesn't look like you're logged in. Try "fly auth signup" to create an account, or "fly auth login" to log in to an existing account.`
+		cmd.Println(text.Wrap(msg, 80))
+		cmd.Println()
+	}
+
+	cmd.Println("Here's a few commands to get you started:")
+
+	importantCommands := [][]string{
+		{"launch"},
+		{"status"},
+		{"deploy"},
+		{"logs"},
+		{"apps"},
+		{"machines"},
+	}
+
+	for _, path := range importantCommands {
+		c, _, err := cmd.Traverse(path)
+		if err != nil {
+			panic(err)
 		}
+		cmd.Printf("  %s %s\n", tablewriter.PadRight(c.CommandPath(), " ", 16), c.Short)
 	}
 
-	if cmd.RunE == nil && cmd.Run == nil {
-		return
-	}
+	cmd.Println()
 
-	if cmd.RunE == nil {
-		panic(cmd.Name())
-	}
+	cmd.Println("If you need help along the way:")
+	cmd.Println("  Use `fly docs` to open the Fly.io documentation, or visit https://fly.io/docs.")
+	cmd.Println("  Use `fly <command> --help` for more information about a command.")
+	cmd.Println("  Visit https://community.fly.io to get help from the Fly.io community.")
 
-	cmd.RunE = command.WrapRunE(cmd.RunE)
+	cmd.Println()
+	cmd.Println("For a full list of commands, run `fly help`.")
+
+	return nil
+}
+
+func group(cmd *cobra.Command, id string) *cobra.Command {
+	cmd.GroupID = id
+	return cmd
 }

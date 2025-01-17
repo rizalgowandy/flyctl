@@ -3,17 +3,14 @@ package machine
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"syscall"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/flaps"
-	"github.com/superfly/flyctl/internal/app"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
-	"github.com/superfly/flyctl/iostreams"
+	mach "github.com/superfly/flyctl/internal/machine"
 )
 
 func newRestart() *cobra.Command {
@@ -21,7 +18,7 @@ func newRestart() *cobra.Command {
 		short = "Restart one or more Fly machines"
 		long  = short + "\n"
 
-		usage = "restart <id> [<id>...]"
+		usage = "restart [<id>...]"
 	)
 
 	cmd := command.New(usage, short, long, runMachineRestart,
@@ -29,12 +26,13 @@ func newRestart() *cobra.Command {
 		command.LoadAppNameIfPresent,
 	)
 
-	cmd.Args = cobra.MinimumNArgs(1)
+	cmd.Args = cobra.ArbitraryArgs
 
 	flag.Add(
 		cmd,
 		flag.App(),
 		flag.AppConfig(),
+		selectFlag,
 		flag.String{
 			Name:        "signal",
 			Shorthand:   "s",
@@ -49,77 +47,48 @@ func newRestart() *cobra.Command {
 			Name:        "force",
 			Description: "Force stop the machine(s)",
 		},
+		flag.Bool{
+			Name:        "skip-health-checks",
+			Description: "Restarts app without waiting for health checks.",
+			Default:     false,
+		},
 	)
 
 	return cmd
 }
 
-func runMachineRestart(ctx context.Context) (err error) {
+func runMachineRestart(ctx context.Context) error {
 	var (
-		io      = iostreams.FromContext(ctx)
 		args    = flag.Args(ctx)
-		signal  = flag.GetString(ctx, "signal")
 		timeout = flag.GetInt(ctx, "time")
 	)
 
-	var forceStop = false
-
-	if flag.GetBool(ctx, "force") {
-		forceStop = true
+	// Resolve flags
+	input := &fly.RestartMachineInput{
+		Timeout:          time.Duration(timeout) * time.Second,
+		ForceStop:        flag.GetBool(ctx, "force"),
+		SkipHealthChecks: flag.GetBool(ctx, "skip-health-checks"),
+		Signal:           strings.ToUpper(flag.GetString(ctx, "signal")),
 	}
 
-	for _, machineID := range args {
-		fmt.Fprintf(io.Out, "Sending kill signal to machine %s...", machineID)
+	machines, ctx, err := selectManyMachines(ctx, args)
+	if err != nil {
+		return err
+	}
 
-		if err = Restart(ctx, machineID, signal, timeout, forceStop); err != nil {
-			return
+	// Acquire leases
+	machines, releaseLeaseFunc, err := mach.AcquireLeases(ctx, machines)
+	defer releaseLeaseFunc()
+	if err != nil {
+		return err
+	}
+
+	// Restart each machine
+	for _, machine := range machines {
+		if err := mach.Restart(ctx, machine, input, machine.LeaseNonce); err != nil {
+			return fmt.Errorf("failed to restart machine %s: %w", machine.ID, err)
 		}
-		fmt.Fprintf(io.Out, "%s has been successfully stopped\n", machineID)
-	}
-	return
-}
-
-func Restart(ctx context.Context, machineID, sig string, timeOut int, forceStop bool) (err error) {
-	var (
-		appName = app.NameFromContext(ctx)
-	)
-
-	input := api.RestartMachineInput{
-		ID:        machineID,
-		Timeout:   time.Duration(timeOut),
-		ForceStop: forceStop,
 	}
 
-	if sig != "" {
-		signal := &api.Signal{}
-
-		s, err := strconv.Atoi(sig)
-		if err != nil {
-			return fmt.Errorf("could not get signal %s", err)
-		}
-		signal.Signal = syscall.Signal(s)
-		input.Signal = signal
-	}
-
-	app, err := appFromMachineOrName(ctx, machineID, appName)
-	if err != nil {
-		return fmt.Errorf("could not get app: %w", err)
-	}
-
-	flapsClient, err := flaps.New(ctx, app)
-	if err != nil {
-		return fmt.Errorf("could not make flaps client: %w", err)
-	}
-
-	err = flapsClient.Restart(ctx, input)
-	if err != nil {
-		return fmt.Errorf("could not stop machine %s: %w", input.ID, err)
-	}
-
-	ctx = flaps.NewContext(ctx, flapsClient)
-	if err = WaitForStartOrStop(ctx, &api.Machine{ID: input.ID}, "start", time.Minute*5); err != nil {
-		return
-	}
-
-	return
+	return nil
 }

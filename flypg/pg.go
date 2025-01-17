@@ -67,19 +67,6 @@ func (c *Client) CreateDatabase(ctx context.Context, name string) error {
 	return nil
 }
 
-func (c *Client) DeleteDatabase(ctx context.Context, name string) error {
-	endpoint := "/commands/databases/delete"
-
-	in := &DeleteDatabaseRequest{
-		Name: name,
-	}
-
-	if err := c.Do(ctx, http.MethodDelete, endpoint, in, nil); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (c *Client) DatabaseExists(ctx context.Context, name string) (bool, error) {
 	endpoint := "/commands/databases"
 
@@ -120,28 +107,6 @@ func (c *Client) UserExists(ctx context.Context, name string) (bool, error) {
 	return false, nil
 }
 
-func (c *Client) NodeRole(ctx context.Context) (string, error) {
-	endpoint := "/commands/admin/role"
-
-	out := new(NodeRoleResponse)
-
-	if err := c.Do(ctx, http.MethodGet, endpoint, nil, out); err != nil {
-		return "", err
-	}
-	return out.Result, nil
-}
-
-func (c *Client) RestartNodePG(ctx context.Context) error {
-	endpoint := "/commands/admin/restart"
-
-	out := new(RestartResponse)
-
-	if err := c.Do(ctx, http.MethodGet, endpoint, nil, out); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (c *Client) Failover(ctx context.Context) error {
 	endpoint := "/commands/admin/failover/trigger"
 
@@ -151,8 +116,11 @@ func (c *Client) Failover(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) SettingsView(ctx context.Context, settings []string) (*PGSettings, error) {
+func (c *Client) ViewSettings(ctx context.Context, settings []string, manager string) (*PGSettings, error) {
 	endpoint := "/commands/admin/settings/view"
+	if manager == ReplicationManager {
+		endpoint = "/commands/admin/settings/view/postgres"
+	}
 
 	out := new(SettingsViewResponse)
 
@@ -161,4 +129,24 @@ func (c *Client) SettingsView(ctx context.Context, settings []string) (*PGSettin
 	}
 
 	return &out.Result, nil
+}
+
+func (c *Client) UpdateSettings(ctx context.Context, settings map[string]string) error {
+	endpoint := "/commands/admin/settings/update/postgres"
+
+	if err := c.Do(ctx, http.MethodPost, endpoint, settings, nil); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SyncSettings is specific to the repmgr/flex implementation.
+func (c *Client) SyncSettings(ctx context.Context) error {
+	endpoint := "/commands/admin/settings/apply"
+
+	if err := c.Do(ctx, http.MethodPost, endpoint, nil, nil); err != nil {
+		return err
+	}
+	return nil
 }

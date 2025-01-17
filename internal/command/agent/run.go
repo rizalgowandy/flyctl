@@ -9,11 +9,14 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/agent/server"
+	"github.com/superfly/flyctl/flyctl"
 
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/command"
+	"github.com/superfly/flyctl/internal/config"
 	"github.com/superfly/flyctl/internal/filemu"
 	"github.com/superfly/flyctl/internal/flag"
 	"github.com/superfly/flyctl/internal/state"
@@ -25,6 +28,9 @@ func newRun() (cmd *cobra.Command) {
 		long  = short + "\n"
 	)
 
+	// Don't use RequireSession preparer. It does its own token monitoring and
+	// will try to run token discharge flows that would involve opening URLs in
+	// the  user's browser. We don't want to do that in a background agent.
 	cmd = command.New("run", short, long, run)
 
 	cmd.Args = cobra.MaximumNArgs(1)
@@ -44,11 +50,9 @@ func run(ctx context.Context) error {
 	}
 	defer closeLogger()
 
-	apiClient := client.FromContext(ctx)
-	if !apiClient.Authenticated() {
-		logger.Println(client.ErrNoAuthToken)
-
-		return client.ErrNoAuthToken
+	if config.Tokens(ctx).GraphQL() == "" {
+		logger.Println(fly.ErrNoAuthToken)
+		return fly.ErrNoAuthToken
 	}
 
 	unlock, err := lock(ctx, logger)
@@ -58,11 +62,11 @@ func run(ctx context.Context) error {
 	defer unlock()
 
 	opt := server.Options{
-		Socket:     socketPath(ctx),
-		Logger:     logger,
-		Client:     apiClient.API(),
-		Background: logPath != "",
-		ConfigFile: state.ConfigFile(ctx),
+		Socket:           socketPath(ctx),
+		Logger:           logger,
+		Background:       logPath != "",
+		ConfigFile:       state.ConfigFile(ctx),
+		ConfigWebsockets: viper.GetBool(flyctl.ConfigWireGuardWebsockets),
 	}
 
 	return server.Run(ctx, opt)
@@ -104,13 +108,14 @@ func (*dupInstanceError) Description() string {
 	return "It looks like another instance of the agent is already running. Please stop it before starting a new one."
 }
 
-var (
-	lockPath       = filepath.Join(os.TempDir(), "flyctl.agent.lock")
-	errDupInstance = new(dupInstanceError)
-)
+var errDupInstance = new(dupInstanceError)
+
+func lockPath() string {
+	return filepath.Join(flyctl.ConfigDir(), "flyctl.agent.lock")
+}
 
 func lock(ctx context.Context, logger *log.Logger) (unlock filemu.UnlockFunc, err error) {
-	switch unlock, err = filemu.Lock(ctx, lockPath); {
+	switch unlock, err = filemu.Lock(ctx, lockPath()); {
 	case err == nil:
 		break // all done
 	case ctx.Err() != nil:

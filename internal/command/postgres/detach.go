@@ -5,14 +5,15 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/flaps"
 	"github.com/superfly/flyctl/flypg"
-	"github.com/superfly/flyctl/internal/app"
+	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
+	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
+	mach "github.com/superfly/flyctl/internal/machine"
 	"github.com/superfly/flyctl/internal/prompt"
 	"github.com/superfly/flyctl/iostreams"
 )
@@ -21,7 +22,7 @@ func newDetach() *cobra.Command {
 	const (
 		short = "Detach a postgres cluster from an app"
 		long  = short + "\n"
-		usage = "detach [POSTGRES APP]"
+		usage = "detach <POSTGRES APP>"
 	)
 
 	cmd := command.New(usage, short, long, runDetach,
@@ -41,53 +42,64 @@ func newDetach() *cobra.Command {
 
 func runDetach(ctx context.Context) error {
 	var (
-		MinPostgresHaVersion = "0.0.19"
-		appName              = app.NameFromContext(ctx)
-		pgAppName            = flag.FirstArg(ctx)
-		client               = client.FromContext(ctx).API()
-	)
+		client = flyutil.ClientFromContext(ctx)
 
-	app, err := client.GetApp(ctx, appName)
-	if err != nil {
-		return fmt.Errorf("get app: %w", err)
-	}
+		pgAppName = flag.FirstArg(ctx)
+		appName   = appconfig.NameFromContext(ctx)
+	)
 
 	pgApp, err := client.GetAppCompact(ctx, pgAppName)
 	if err != nil {
+		return fmt.Errorf("get postgres app: %w", err)
+	}
+
+	app, err := client.GetAppCompact(ctx, appName)
+	if err != nil {
 		return fmt.Errorf("get app: %w", err)
 	}
 
-	agentclient, err := agent.Establish(ctx, client)
+	ctx, err = apps.BuildContext(ctx, pgApp)
 	if err != nil {
-		return fmt.Errorf("can't establish agent %w", err)
+		return err
 	}
+	return runMachineDetach(ctx, app, pgApp)
+}
 
-	dialer, err := agentclient.Dialer(ctx, app.Organization.Slug)
+func runMachineDetach(ctx context.Context, app *fly.AppCompact, pgApp *fly.AppCompact) error {
+	var (
+		MinPostgresHaVersion         = "0.0.19"
+		MinPostgresFlexVersion       = "0.0.3"
+		MinPostgresStandaloneVersion = "0.0.7"
+	)
+
+	machines, err := mach.ListActive(ctx)
 	if err != nil {
-		return fmt.Errorf("can't build tunnel for %s: %s", app.Organization.Slug, err)
+		return fmt.Errorf("machines could not be retrieved %w", err)
 	}
-	ctx = agent.DialerWithContext(ctx, dialer)
 
-	switch pgApp.PlatformVersion {
-	case "nomad":
-		if err := hasRequiredVersionOnNomad(pgApp, MinPostgresHaVersion, MinPostgresHaVersion); err != nil {
-			return err
-		}
-	case "machines":
-
-		flapsClient, err := flaps.New(ctx, pgApp)
-		if err != nil {
-			return fmt.Errorf("list of machines could not be retrieved: %w", err)
-		}
-
-		members, err := flapsClient.ListActive(ctx)
-		if err != nil {
-			return fmt.Errorf("machines could not be retrieved %w", err)
-		}
-		if err := hasRequiredVersionOnMachines(members, MinPostgresHaVersion, MinPostgresHaVersion); err != nil {
-			return err
-		}
+	if err := hasRequiredVersionOnMachines(app.Name, machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
+		return err
 	}
+
+	if len(machines) == 0 {
+		return fmt.Errorf("no 6pn ips founds for %s app", pgApp.Name)
+	}
+
+	leader, err := pickLeader(ctx, machines)
+	if err != nil {
+		return err
+	}
+
+	return detachAppFromPostgres(ctx, leader.PrivateIP, app, pgApp)
+}
+
+// TODO - This process needs to be re-written to suppport non-interactive terminals.
+func detachAppFromPostgres(ctx context.Context, leaderIP string, app *fly.AppCompact, pgApp *fly.AppCompact) error {
+	var (
+		client = flyutil.ClientFromContext(ctx)
+		dialer = agent.DialerFromContext(ctx)
+		io     = iostreams.FromContext(ctx)
+	)
 
 	attachments, err := client.ListPostgresClusterAttachments(ctx, app.ID, pgApp.ID)
 	if err != nil {
@@ -115,7 +127,7 @@ func runDetach(ctx context.Context) error {
 
 	targetAttachment := attachments[selected]
 
-	pgclient := flypg.New(pgAppName, dialer)
+	pgclient := flypg.NewFromInstance(leaderIP, dialer)
 
 	// Remove user if exists
 	exists, err := pgclient.UserExists(ctx, targetAttachment.DatabaseUser)
@@ -129,10 +141,8 @@ func runDetach(ctx context.Context) error {
 		}
 	}
 
-	io := iostreams.FromContext(ctx)
-
 	// Remove secret from consumer app.
-	_, err = client.UnsetSecrets(ctx, appName, []string{targetAttachment.EnvironmentVariableName})
+	_, err = client.UnsetSecrets(ctx, app.Name, []string{targetAttachment.EnvironmentVariableName})
 	if err != nil {
 		// This will error if secret doesn't exist, so just send to stdout.
 		fmt.Fprintln(io.Out, err.Error())
@@ -143,9 +153,9 @@ func runDetach(ctx context.Context) error {
 		)
 	}
 
-	input := api.DetachPostgresClusterInput{
-		AppID:                       appName,
-		PostgresClusterId:           pgAppName,
+	input := fly.DetachPostgresClusterInput{
+		AppID:                       app.Name,
+		PostgresClusterId:           pgApp.Name,
 		PostgresClusterAttachmentId: targetAttachment.ID,
 	}
 

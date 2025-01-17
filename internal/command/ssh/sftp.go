@@ -9,15 +9,16 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/pkg/sftp"
 	"github.com/spf13/cobra"
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/internal/app"
+	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 
 	"github.com/chzyer/readline"
 	"github.com/google/shlex"
@@ -43,12 +44,12 @@ func NewSFTP() *cobra.Command {
 
 func newSFTPShell() *cobra.Command {
 	const (
-		long  = `The SFTP SHELL command brings up an interactive SFTP session to fetch and push files from/to a VM:.`
+		long  = `The SFTP SHELL command brings up an interactive SFTP session to fetch and push files from/to a VM.`
 		short = long
 		usage = "shell"
 	)
 
-	cmd := command.New(usage, short, long, runShell, command.RequireSession, command.LoadAppNameIfPresent)
+	cmd := command.New(usage, short, long, runShell, command.RequireSession, command.RequireAppName)
 
 	stdArgsSSH(cmd)
 
@@ -62,7 +63,7 @@ func newFind() *cobra.Command {
 		usage = "find [path]"
 	)
 
-	cmd := command.New(usage, short, long, runLs, command.RequireSession, command.LoadAppNameIfPresent)
+	cmd := command.New(usage, short, long, runLs, command.RequireSession, command.RequireAppName)
 
 	stdArgsSSH(cmd)
 
@@ -76,26 +77,30 @@ func newGet() *cobra.Command {
 		usage = "get <path>"
 	)
 
-	cmd := command.New(usage, short, long, runGet, command.RequireSession, command.LoadAppNameIfPresent)
+	cmd := command.New(usage, short, long, runGet, command.RequireSession, command.RequireAppName)
 
 	cmd.Args = cobra.MaximumNArgs(2)
 
 	stdArgsSSH(cmd)
 
 	return cmd
-
 }
 
 func newSFTPConnection(ctx context.Context) (*sftp.Client, error) {
-	client := client.FromContext(ctx).API()
-	appName := app.NameFromContext(ctx)
+	client := flyutil.ClientFromContext(ctx)
+	appName := appconfig.NameFromContext(ctx)
 
 	app, err := client.GetAppCompact(ctx, appName)
 	if err != nil {
 		return nil, fmt.Errorf("get app: %w", err)
 	}
 
-	agentclient, dialer, err := bringUp(ctx, client, app)
+	network, err := client.GetAppNetwork(ctx, appName)
+	if err != nil {
+		return nil, fmt.Errorf("get app network: %w", err)
+	}
+
+	agentclient, dialer, err := BringUpAgent(ctx, client, app, *network, quiet(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -105,20 +110,18 @@ func newSFTPConnection(ctx context.Context) (*sftp.Client, error) {
 		return nil, err
 	}
 
-	params := &SSHParams{
+	params := &ConnectParams{
 		Ctx:            ctx,
 		Org:            app.Organization,
 		Dialer:         dialer,
-		App:            appName,
-		Stdin:          os.Stdin,
-		Stdout:         os.Stdout,
-		Stderr:         os.Stderr,
+		Username:       DefaultSshUsername,
 		DisableSpinner: true,
+		AppNames:       []string{app.Name},
 	}
 
-	conn, err := sshConnect(params, addr)
+	conn, err := Connect(params, addr)
 	if err != nil {
-		captureError(err, app)
+		captureError(ctx, err, app)
 		return nil, err
 	}
 
@@ -146,7 +149,7 @@ func runLs(ctx context.Context) error {
 			return err
 		}
 
-		fmt.Printf(walker.Path() + "\n")
+		fmt.Println(walker.Path())
 	}
 
 	return nil
@@ -164,7 +167,7 @@ func runGet(ctx context.Context) error {
 
 	case 1:
 		remote = args[0]
-		local = remote
+		local = filepath.Base(remote)
 
 	default:
 		remote = args[0]
@@ -172,7 +175,7 @@ func runGet(ctx context.Context) error {
 	}
 
 	if _, err := os.Stat(local); err == nil {
-		return fmt.Errorf("get: local file %s: already exists", remote)
+		return fmt.Errorf("file %s is already there. `fly ssh` doesn't override existing files for safety.", local)
 	}
 
 	ftp, err := newSFTPConnection(ctx)
@@ -186,7 +189,7 @@ func runGet(ctx context.Context) error {
 	}
 	defer rf.Close()
 
-	f, err := os.OpenFile(local, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+	f, err := os.OpenFile(local, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("get: local file %s: %w", local, err)
 	}
@@ -198,7 +201,7 @@ func runGet(ctx context.Context) error {
 	}
 
 	fmt.Printf("%d bytes written to %s\n", bytes, local)
-	return nil
+	return f.Sync()
 }
 
 var completer = readline.NewPrefixCompleter(
@@ -313,7 +316,7 @@ func (sc *sftpContext) getDir(rpath string, args []string) {
 		return
 	}
 
-	f, err := os.OpenFile(lpath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	f, err := os.OpenFile(lpath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		sc.out("get %s -> %s: %s", rpath, lpath, err)
 		return
@@ -367,6 +370,11 @@ func (sc *sftpContext) getDir(rpath string, args []string) {
 	}
 
 	z.Close()
+
+	err = f.Sync()
+	if err != nil {
+		sc.out("failed to sync %s: %s", lpath, err)
+	}
 }
 
 func (sc *sftpContext) chmod(args ...string) error {
@@ -435,7 +443,8 @@ func (sc *sftpContext) put(args ...string) error {
 		sc.out("put %s -> %s: open local file: %s", lpath, rpath, err)
 		return nil
 	}
-	defer f.Close()
+	// Safe to ignore the error because this file is for reading.
+	defer f.Close() // skipcq: GO-S2307
 
 	rf, err := sc.ftp.OpenFile(rpath, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
@@ -486,7 +495,7 @@ func (sc *sftpContext) get(args ...string) error {
 
 	_, err = os.Stat(localFile)
 	if err == nil {
-		sc.out("get %s -> %s: file exists", rpath, localFile)
+		sc.out("file %s is already there. `fly ssh` doesn't overwrite existing files for safety.", localFile)
 		return nil
 	}
 
@@ -498,7 +507,7 @@ func (sc *sftpContext) get(args ...string) error {
 		}
 		defer rf.Close()
 
-		f, err := os.OpenFile(localFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		f, err := os.OpenFile(localFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
 			sc.out("get %s -> %s: %s", rpath, localFile, err)
 			return
@@ -512,6 +521,10 @@ func (sc *sftpContext) get(args ...string) error {
 			sc.out("get %s -> %s: %s (wrote %d bytes)", rpath, localFile, err, bytes)
 		} else {
 			sc.out("wrote %d bytes", bytes)
+		}
+		err = f.Sync()
+		if err != nil {
+			sc.out("failed to sync %s: %s", localFile, err)
 		}
 	}()
 

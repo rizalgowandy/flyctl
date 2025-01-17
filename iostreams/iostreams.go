@@ -6,13 +6,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/AlecAivazis/survey/v2/terminal"
 	"github.com/briandowns/spinner"
 	"github.com/cli/safeexec"
 	"github.com/google/shlex"
@@ -305,14 +305,14 @@ func (s *IOStreams) ReadUserFile(fn string) ([]byte, error) {
 		}
 	}
 	defer r.Close()
-	return ioutil.ReadAll(r)
+	return io.ReadAll(r)
 }
 
 func (s *IOStreams) TempFile(dir, pattern string) (*os.File, error) {
 	if s.TempFileOverride != nil {
 		return s.TempFileOverride, nil
 	}
-	return ioutil.TempFile(dir, pattern)
+	return os.CreateTemp(dir, pattern)
 }
 
 func (s *IOStreams) CreateLink(text string, url string) string {
@@ -321,6 +321,47 @@ func (s *IOStreams) CreateLink(text string, url string) string {
 	} else {
 		return text + " (\u200B" + url + ")"
 	}
+}
+
+// writerWithFd implements a [terminal.FileWriter]
+type writerWithFd struct {
+	io.Writer
+	orig *os.File
+}
+
+func (w writerWithFd) Fd() uintptr {
+	return w.orig.Fd()
+}
+
+func IsTerminalWriter(w io.Writer) bool {
+	if w == os.Stdout || w == os.Stderr {
+		return true
+	}
+	if wf, ok := w.(writerWithFd); ok {
+		return wf.Fd() == os.Stdout.Fd() || wf.Fd() == os.Stderr.Fd()
+	}
+	return false
+}
+
+// colorableOut transforms a file writer into one where it is safe to write ANSI escape codes to.
+func colorableOut(w terminal.FileWriter) terminal.FileWriter {
+	if f, ok := w.(*os.File); ok {
+		out := colorable.NewColorable(f)
+		if f, ok := out.(*os.File); ok {
+			// Most cases will end up here: the writer is either
+			// 1. the original os.Stdout; or
+			// 2. the original os.Stdout with virtual terminal processing enabled on Windows.
+			return f
+		}
+		// If we have reached this point, the resulting writer is a Windows-specific writer that
+		// converts ANSI escape codes to Console API calls, and we need to wrap it in an extra
+		// type to preserve the original file descriptor.
+		return &writerWithFd{
+			Writer: out,
+			orig:   f,
+		}
+	}
+	return w
 }
 
 func System() *IOStreams {
@@ -332,7 +373,7 @@ func System() *IOStreams {
 	io := &IOStreams{
 		In:           os.Stdin,
 		originalOut:  os.Stdout,
-		Out:          colorable.NewColorable(os.Stdout),
+		Out:          colorableOut(os.Stdout),
 		ErrOut:       colorable.NewColorable(os.Stderr),
 		colorEnabled: EnvColorForced() || (!EnvColorDisabled() && stdoutIsTTY),
 		is256enabled: Is256ColorSupported(),
@@ -354,7 +395,7 @@ func Test() (*IOStreams, *bytes.Buffer, *bytes.Buffer, *bytes.Buffer) {
 	out := &bytes.Buffer{}
 	errOut := &bytes.Buffer{}
 	return &IOStreams{
-		In:     ioutil.NopCloser(in),
+		In:     io.NopCloser(in),
 		Out:    out,
 		ErrOut: errOut,
 	}, in, out, errOut

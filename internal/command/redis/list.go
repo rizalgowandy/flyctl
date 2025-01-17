@@ -9,9 +9,9 @@ import (
 	"github.com/superfly/flyctl/gql"
 	"github.com/superfly/flyctl/iostreams"
 
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/render"
 )
 
@@ -24,6 +24,8 @@ func newList() (cmd *cobra.Command) {
 
 	cmd = command.New(usage, short, long, runList, command.RequireSession)
 
+	cmd.Aliases = []string{"ls"}
+
 	flag.Add(cmd,
 		flag.Org(),
 	)
@@ -34,44 +36,36 @@ func newList() (cmd *cobra.Command) {
 func runList(ctx context.Context) (err error) {
 	var (
 		out    = iostreams.FromContext(ctx).Out
-		client = client.FromContext(ctx).API().GenqClient
+		client = flyutil.ClientFromContext(ctx).GenqClient()
 	)
 
-	_ = `# @genqlient
-		query ListAddOns($addOnType: AddOnType) {
-			addOns(type: $addOnType) {
-				nodes {
-					id
-					name
-					addOnPlan {
-						displayName
-					}
-					privateIp
-					primaryRegion
-					readRegions
-					organization {
-						id
-						slug
-					}
-				}
-			}
-		}
-	`
-	response, err := gql.ListAddOns(ctx, client, "redis")
+	response, err := gql.ListAddOns(ctx, client, "upstash_redis")
 
 	var rows [][]string
 
 	for _, addon := range response.AddOns.Nodes {
+		options, _ := addon.Options.(map[string]interface{})
+
+		if options == nil {
+			options = make(map[string]interface{})
+		}
+		eviction := "Disabled"
+
+		if options["eviction"] != nil && options["eviction"].(bool) {
+			eviction = "Enabled"
+		}
+
 		rows = append(rows, []string{
 			addon.Name,
 			addon.Organization.Slug,
 			addon.AddOnPlan.DisplayName,
+			eviction,
 			addon.PrimaryRegion,
 			strings.Join(addon.ReadRegions, ","),
 		})
 	}
 
-	_ = render.Table(out, "", rows, "Name", "Org", "Plan", "Primary Region", "Read Regions")
+	_ = render.Table(out, "", rows, "Name", "Org", "Plan", "Eviction", "Primary Region", "Read Regions")
 
 	return
 }

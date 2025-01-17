@@ -3,13 +3,14 @@ package platform
 import (
 	"context"
 	"fmt"
+	"sort"
 
+	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/internal/command"
-	"github.com/superfly/flyctl/internal/config"
+	"github.com/superfly/flyctl/internal/flag"
 	"github.com/superfly/flyctl/internal/render"
 	"github.com/superfly/flyctl/iostreams"
 )
@@ -21,50 +22,80 @@ func newVMSizes() (cmd *cobra.Command) {
 		short = "List VM Sizes"
 	)
 
-	cmd = command.New("vm-sizes", short, long, runVMSizes,
+	cmd = command.New("vm-sizes", short, long, runMachineVMSizes,
 		command.RequireSession,
 	)
 
 	cmd.Args = cobra.NoArgs
 
+	flag.Add(cmd, flag.JSONOutput())
 	return
 }
 
-func runVMSizes(ctx context.Context) error {
-	client := client.FromContext(ctx).API()
-
-	sizes, err := client.PlatformVMSizes(ctx)
-	if err != nil {
-		return fmt.Errorf("failed retrieving sizes: %w", err)
-	}
-
+func runMachineVMSizes(ctx context.Context) error {
 	out := iostreams.FromContext(ctx).Out
-	if config.FromContext(ctx).JSONOutput {
-		return render.JSON(out, sizes)
+
+	type preset struct {
+		guest   *fly.MachineGuest
+		strings []string
 	}
 
-	var rows [][]string
-	for _, size := range sizes {
-		rows = append(rows, []string{
-			size.Name,
-			cores(size),
-			memory(size),
-		})
+	sortedPresets := lo.MapToSlice(fly.MachinePresets, func(key string, value *fly.MachineGuest) preset {
+		arr := []string{
+			key,
+			cores(value.CPUs),
+			memory(value.MemoryMB),
+			value.GPUKind,
+		}
+		return preset{value, arr}
+	})
+
+	sort.Slice(sortedPresets, func(i, j int) bool {
+		a := sortedPresets[i].guest
+		b := sortedPresets[j].guest
+		switch {
+		case a.CPUs != b.CPUs:
+			return a.CPUs < b.CPUs
+		case a.MemoryMB != b.MemoryMB:
+			return a.MemoryMB < b.MemoryMB
+		default:
+			return a.GPUKind < b.GPUKind
+		}
+	})
+
+	// Filter and display shared cpu sizes.
+	shared := lo.FilterMap(sortedPresets, func(p preset, _ int) ([]string, bool) {
+		return p.strings, p.guest.CPUKind == "shared" && p.guest.GPUKind == ""
+	})
+	if err := render.Table(out, "Machines platform", shared, "Name", "CPU Cores", "Memory"); err != nil {
+		return err
 	}
 
-	return render.Table(out, "", rows, "Name", "CPU Cores", "Memory")
+	// Filter and display performance cpu sizes.
+	performance := lo.FilterMap(sortedPresets, func(p preset, _ int) ([]string, bool) {
+		return p.strings, p.guest.CPUKind == "performance" && p.guest.GPUKind == ""
+	})
+	if err := render.Table(out, "", performance, "Name", "CPU Cores", "Memory"); err != nil {
+		return err
+	}
+
+	// Filter and display gpu sizes.
+	gpus := lo.FilterMap(sortedPresets, func(p preset, _ int) ([]string, bool) {
+		return p.strings, p.guest.GPUKind != ""
+	})
+	return render.Table(out, "", gpus, "Name", "CPU Cores", "Memory", "GPU model")
 }
 
-func cores(size api.VMSize) string {
-	if size.CPUCores < 1.0 {
-		return fmt.Sprintf("%.2f", size.CPUCores)
+func cores(cores int) string {
+	if cores < 1.0 {
+		return fmt.Sprintf("%d", cores)
 	}
-	return fmt.Sprintf("%d", int(size.CPUCores))
+	return fmt.Sprintf("%d", cores)
 }
 
-func memory(size api.VMSize) string {
-	if size.MemoryGB < 1.0 {
-		return fmt.Sprintf("%d MB", size.MemoryMB)
+func memory(size int) string {
+	if size < 1024 {
+		return fmt.Sprintf("%d MB", size)
 	}
-	return fmt.Sprintf("%d GB", int(size.MemoryGB))
+	return fmt.Sprintf("%d GB", size/1024)
 }

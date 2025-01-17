@@ -3,17 +3,19 @@ package machine
 import (
 	"context"
 	"fmt"
-	"time"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
-	"github.com/superfly/flyctl/api"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/iostreams"
 
-	"github.com/superfly/flyctl/flaps"
-	"github.com/superfly/flyctl/internal/app"
+	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyerr"
+	mach "github.com/superfly/flyctl/internal/machine"
+	"github.com/superfly/flyctl/internal/watch"
 )
 
 func newUpdate() *cobra.Command {
@@ -33,94 +35,140 @@ func newUpdate() *cobra.Command {
 		cmd,
 		flag.Image(),
 		sharedFlags,
+		flag.Yes(),
+		selectFlag,
+		flag.Bool{
+			Name:        "skip-start",
+			Description: "Updates machine without starting it.",
+			Default:     false,
+		},
+		flag.Bool{
+			Name:        "skip-health-checks",
+			Description: "Updates machine without waiting for health checks.",
+			Default:     false,
+		},
+		flag.String{
+			Name:        "command",
+			Shorthand:   "C",
+			Description: "Command to run",
+		},
+		flag.String{
+			Name:        "mount-point",
+			Description: "New volume mount point",
+		},
+		flag.Int{
+			Name:        "wait-timeout",
+			Description: "Seconds to wait for individual machines to transition states and become healthy. (default 300)",
+			Default:     300,
+		},
 	)
 
-	cmd.Args = cobra.ExactArgs(1)
+	cmd.Args = cobra.RangeArgs(0, 1)
 
 	return cmd
 }
 
 func runUpdate(ctx context.Context) (err error) {
 	var (
-		appName  = app.NameFromContext(ctx)
 		io       = iostreams.FromContext(ctx)
 		colorize = io.ColorScheme()
+
+		autoConfirm      = flag.GetBool(ctx, "yes")
+		skipHealthChecks = flag.GetBool(ctx, "skip-health-checks")
+		skipStart        = flag.GetBool(ctx, "skip-start")
+		image            = flag.GetString(ctx, "image")
+		dockerfile       = flag.GetString(ctx, flag.Dockerfile().Name)
 	)
 
 	machineID := flag.FirstArg(ctx)
+	haveMachineID := len(flag.Args(ctx)) > 0
+	machine, ctx, err := selectOneMachine(ctx, "", machineID, haveMachineID)
+	if err != nil {
+		return err
+	}
+	appName := appconfig.NameFromContext(ctx)
 
-	app, err := appFromMachineOrName(ctx, machineID, appName)
+	if machine.HostStatus != fly.HostStatusOk {
+		return fmt.Errorf("the machine is on an unreachable host, try again later")
+	}
+
+	// Acquire lease
+	machine, releaseLeaseFunc, err := mach.AcquireLease(ctx, machine)
+	defer releaseLeaseFunc()
 	if err != nil {
 		return err
 	}
 
-	flapsClient, err := flaps.New(ctx, app)
-	if err != nil {
-		return fmt.Errorf("could not make API client: %w", err)
-	}
-	ctx = flaps.NewContext(ctx, flapsClient)
-
-	machine, err := flapsClient.Get(ctx, machineID)
-	if err != nil {
-		return err
-	}
-
-	imageOrPath := machine.Config.Image
-	image := flag.GetString(ctx, flag.ImageName)
-	dockerfile := flag.GetString(ctx, flag.Dockerfile().Name)
-	if len(image) > 0 {
+	var imageOrPath string
+	if image != "" {
 		imageOrPath = image
-	} else if len(dockerfile) > 0 {
-		imageOrPath = "." // cwd
+	} else if dockerfile != "" {
+		imageOrPath = "."
 	}
 
-	prevInstanceID := machine.InstanceID
-
-	fmt.Fprintf(io.Out, "Machine %s was found and is currently in a %s state, attempting to update...\n", machineID, machine.State)
-
-	machineConf := *machine.Config
-	machineConf, err = determineMachineConfig(ctx, machineConf, app, imageOrPath)
-	if err != nil {
-		return
-	}
-
-	input := api.LaunchMachineInput{
-		ID:     machine.ID,
-		AppID:  app.Name,
-		Name:   machine.Name,
-		Region: machine.Region,
-		Config: &machineConf,
-	}
-
-	machine, err = flapsClient.Update(ctx, input, "")
+	// Identify configuration changes
+	machineConf, err := determineMachineConfig(ctx, &determineMachineConfigInput{
+		initialMachineConf: *machine.Config,
+		appName:            appName,
+		imageOrPath:        imageOrPath,
+		region:             machine.Region,
+		updating:           true,
+	})
 	if err != nil {
 		return err
 	}
 
-	waitForAction := "start"
-	if machine.Config.Schedule != "" {
-		waitForAction = "stop"
+	if mp := flag.GetString(ctx, "mount-point"); mp != "" {
+		if len(machineConf.Mounts) != 1 {
+			return fmt.Errorf("Machine doesn't have a volume attached")
+		}
+		machineConf.Mounts[0].Path = mp
 	}
 
-	out := io.Out
-	fmt.Fprintln(out, colorize.Yellow(fmt.Sprintf("Machine %s has been updated\n", machine.ID)))
-	fmt.Fprintf(out, "Instance ID has been updated:\n")
-	fmt.Fprintf(out, "%s -> %s\n\n", prevInstanceID, machine.InstanceID)
+	// Prompt user to confirm changes
+	if !autoConfirm {
+		confirmed, err := mach.ConfirmConfigChanges(ctx, machine, *machineConf, "")
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			fmt.Fprintf(io.Out, "No changes to apply\n")
+			return nil
+		}
+	}
 
-	// wait for machine to be started
-	if err := WaitForStartOrStop(ctx, machine, waitForAction, time.Second*60); err != nil {
+	// Perform update
+	input := &fly.LaunchMachineInput{
+		Name:             machine.Name,
+		Region:           machine.Region,
+		Config:           machineConf,
+		SkipLaunch:       len(machineConf.Standbys) > 0 || skipStart,
+		SkipHealthChecks: skipHealthChecks,
+		Timeout:          flag.GetInt(ctx, "wait-timeout"),
+	}
+	if err := mach.Update(ctx, machine, input); err != nil {
+		var timeoutErr mach.WaitTimeoutErr
+		if errors.As(err, &timeoutErr) {
+			return flyerr.GenericErr{
+				Err:      timeoutErr.Error(),
+				Descript: timeoutErr.Description(),
+				Suggest:  "Try increasing the --wait-timeout",
+			}
+
+		}
 		return err
 	}
 
-	fmt.Fprintf(out, "Image: %s\n", machineConf.Image)
+	if !(input.SkipLaunch || flag.GetDetach(ctx)) {
+		fmt.Fprintln(io.Out, colorize.Green("==> "+"Monitoring health checks"))
 
-	if waitForAction == "start" {
-		fmt.Fprintf(out, "State: Started\n\n")
-	} else {
-		fmt.Fprintf(out, "State: Stopped\n\n")
+		if err := watch.MachinesChecks(ctx, []*fly.Machine{machine}); err != nil {
+			return err
+		}
+		fmt.Fprintln(io.Out)
 	}
 
-	fmt.Fprintf(out, "Monitor machine status here:\nhttps://fly.io/apps/%s/machines/%s\n", app.Name, machine.ID)
+	fmt.Fprintf(io.Out, "\nMonitor machine status here:\nhttps://fly.io/apps/%s/machines/%s\n", appName, machine.ID)
 
 	return nil
 }

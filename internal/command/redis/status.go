@@ -5,10 +5,10 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/gql"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/render"
 	"github.com/superfly/flyctl/iostreams"
 )
@@ -36,15 +36,33 @@ func runStatus(ctx context.Context) (err error) {
 	var (
 		io     = iostreams.FromContext(ctx)
 		name   = flag.FirstArg(ctx)
-		client = client.FromContext(ctx).API().GenqClient
+		client = flyutil.ClientFromContext(ctx).GenqClient()
 	)
 
-	response, err := gql.GetAddOn(ctx, client, name)
+	response, err := gql.GetAddOn(ctx, client, name, string(gql.AddOnTypeUpstashRedis))
 	if err != nil {
 		return err
 	}
 
 	addOn := response.AddOn
+
+	var readRegions string = "None"
+
+	if len(addOn.ReadRegions) > 0 {
+		readRegions = strings.Join(addOn.ReadRegions, ",")
+	}
+
+	options, _ := addOn.Options.(map[string]interface{})
+
+	if options == nil {
+		options = make(map[string]interface{})
+	}
+
+	evictionStatus := "Disabled"
+
+	if options["eviction"] != nil && options["eviction"].(bool) {
+		evictionStatus = "Enabled"
+	}
 
 	obj := [][]string{
 		{
@@ -52,12 +70,13 @@ func runStatus(ctx context.Context) (err error) {
 			addOn.Name,
 			addOn.AddOnPlan.DisplayName,
 			addOn.PrimaryRegion,
-			strings.Join(addOn.ReadRegions, ","),
+			readRegions,
+			evictionStatus,
 			addOn.PublicUrl,
 		},
 	}
 
-	var cols []string = []string{"ID", "Name", "Plan", "Primary Region", "Read Regions", "Private URL"}
+	var cols []string = []string{"ID", "Name", "Plan", "Primary Region", "Read Regions", "Eviction", "Private URL"}
 
 	if err = render.VerticalTable(io.Out, "Redis", obj, cols...); err != nil {
 		return

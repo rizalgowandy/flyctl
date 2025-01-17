@@ -4,17 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 
 	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
 
-	"github.com/superfly/flyctl/iostreams"
-
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/internal/app"
+	"github.com/superfly/fly-go/flaps"
+	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/iostreams"
 )
 
 // TODO: make internal once the open command has been deprecated
@@ -44,30 +43,39 @@ to the root URL of the deployed application.
 }
 
 func runOpen(ctx context.Context) error {
-	appName := app.NameFromContext(ctx)
-
-	app, err := client.FromContext(ctx).API().GetAppCompact(ctx, appName)
-	if err != nil {
-		return fmt.Errorf("failed retrieving app %s: %w", appName, err)
-	}
-
-	if !app.Deployed && app.PlatformVersion != "machines" {
-		return errors.New("app has not been deployed yet. Please try deploying your app first")
-	}
-
-	appURL, err := url.Parse("http://" + app.Hostname)
-	if err != nil {
-		return fmt.Errorf("failed parsing app URL (hostname: %s): %w", app.Hostname, err)
-	}
-
-	relURI := flag.FirstArg(ctx)
-	if appURL, err = appURL.Parse(relURI); err != nil {
-		return fmt.Errorf("failed parsing relative URI %s: %w", relURI, err)
-	}
-
 	iostream := iostreams.FromContext(ctx)
-	fmt.Fprintf(iostream.Out, "opening %s ...\n", appURL)
+	appName := appconfig.NameFromContext(ctx)
 
+	flapsClient, err := flapsutil.NewClientWithOptions(ctx, flaps.NewClientOpts{
+		AppName: appName,
+	})
+	if err != nil {
+		return fmt.Errorf("could not create flaps client: %w", err)
+	}
+	ctx = flapsutil.NewContextWithClient(ctx, flapsClient)
+
+	appConfig := appconfig.ConfigFromContext(ctx)
+	if appConfig == nil {
+		appConfig, err = appconfig.FromRemoteApp(ctx, appName)
+		if err != nil {
+			return errors.New("The app config could not be found")
+		}
+	}
+
+	appURL := appConfig.URL()
+	if appURL == nil {
+		return errors.New("The app doesn't expose a public http service")
+	}
+
+	if relURI := flag.FirstArg(ctx); relURI != "" {
+		newURL, err := appURL.Parse(relURI)
+		if err != nil {
+			return fmt.Errorf("failed to parse relative URI '%s': %w", relURI, err)
+		}
+		appURL = newURL
+	}
+
+	fmt.Fprintf(iostream.Out, "opening %s ...\n", appURL)
 	if err := open.Run(appURL.String()); err != nil {
 		return fmt.Errorf("failed opening %s: %w", appURL, err)
 	}

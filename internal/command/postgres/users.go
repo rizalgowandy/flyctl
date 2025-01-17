@@ -5,14 +5,16 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/flaps"
 	"github.com/superfly/flyctl/flypg"
-	"github.com/superfly/flyctl/internal/app"
+	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
+	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/config"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
+	mach "github.com/superfly/flyctl/internal/machine"
 	"github.com/superfly/flyctl/internal/render"
 	"github.com/superfly/flyctl/iostreams"
 )
@@ -47,68 +49,73 @@ func newListUsers() *cobra.Command {
 		command.RequireAppName,
 	)
 
+	cmd.Aliases = []string{"ls"}
+
 	flag.Add(
 		cmd,
 		flag.App(),
 		flag.AppConfig(),
+		flag.JSONOutput(),
 	)
 
 	return cmd
 }
 
-func runListUsers(ctx context.Context) (err error) {
-	// Minimum image version requirements
+func runListUsers(ctx context.Context) error {
 	var (
-		MinPostgresHaVersion = "0.0.19"
-		appName              = app.NameFromContext(ctx)
-		client               = client.FromContext(ctx).API()
-		cfg                  = config.FromContext(ctx)
-		io                   = iostreams.FromContext(ctx)
+		client  = flyutil.ClientFromContext(ctx)
+		appName = appconfig.NameFromContext(ctx)
 	)
 
 	app, err := client.GetAppCompact(ctx, appName)
 	if err != nil {
-		return fmt.Errorf("error getting app %s: %w", appName, err)
+		return fmt.Errorf("failed retrieving app %s: %w", appName, err)
 	}
 
 	if !app.IsPostgresApp() {
-		return fmt.Errorf("%s is not a postgres app", appName)
+		return fmt.Errorf("app %s is not a postgres app", appName)
 	}
 
-	agentclient, err := agent.Establish(ctx, client)
+	ctx, err = apps.BuildContext(ctx, app)
 	if err != nil {
-		return fmt.Errorf("can't establish agent %w", err)
+		return err
 	}
+	return runMachineListUsers(ctx, app)
+}
 
-	dialer, err := agentclient.Dialer(ctx, app.Organization.Slug)
+func runMachineListUsers(ctx context.Context, app *fly.AppCompact) (err error) {
+	// Minimum image version requirements
+	var (
+		MinPostgresHaVersion         = "0.0.19"
+		MinPostgresFlexVersion       = "0.0.3"
+		MinPostgresStandaloneVersion = "0.0.7"
+	)
+
+	machines, err := mach.ListActive(ctx)
 	if err != nil {
-		return fmt.Errorf("ssh: can't build tunnel for %s: %s", app.Organization.Slug, err)
-	}
-	ctx = agent.DialerWithContext(ctx, dialer)
-
-	switch app.PlatformVersion {
-	case "nomad":
-		if err := hasRequiredVersionOnNomad(app, MinPostgresHaVersion, MinPostgresHaVersion); err != nil {
-			return err
-		}
-	case "machines":
-		flapsClient, err := flaps.New(ctx, app)
-		if err != nil {
-			return fmt.Errorf("list of machines could not be retrieved: %w", err)
-		}
-
-		members, err := flapsClient.ListActive(ctx)
-		if err != nil {
-			return fmt.Errorf("machines could not be retrieved %w", err)
-		}
-		if err := hasRequiredVersionOnMachines(members, MinPostgresHaVersion, MinPostgresHaVersion); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unsupported platform %s", app.PlatformVersion)
+		return fmt.Errorf("machines could not be retrieved %w", err)
 	}
 
-	pgclient := flypg.New(appName, dialer)
+	if err := hasRequiredVersionOnMachines(app.Name, machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
+		return err
+	}
+
+	leader, err := pickLeader(ctx, machines)
+	if err != nil {
+		return err
+	}
+
+	return renderUsers(ctx, leader.PrivateIP)
+}
+
+func renderUsers(ctx context.Context, leaderIP string) error {
+	var (
+		io     = iostreams.FromContext(ctx)
+		cfg    = config.FromContext(ctx)
+		dialer = agent.DialerFromContext(ctx)
+	)
+
+	pgclient := flypg.NewFromInstance(leaderIP, dialer)
 
 	users, err := pgclient.ListUsers(ctx)
 	if err != nil {
@@ -124,7 +131,7 @@ func runListUsers(ctx context.Context) (err error) {
 		return render.JSON(io.Out, users)
 	}
 
-	rows := make([][]string, len(users))
+	rows := make([][]string, 0, len(users))
 
 	for _, user := range users {
 		var databases string

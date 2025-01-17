@@ -62,19 +62,19 @@ Download the appropriate version from the [Releases](https://github.com/superfly
 1. Sign into your fly account
 
 ```bash
-flyctl auth login
+fly auth login
 ```
 
 2. List your apps
 
 ```bash
-flyctl apps list
+fly apps list
 ```
 
-2. View app status
+3. View app status
 
 ```bash
-flyctl status -a {app-name}
+fly status -a {app-name}
 ```
 
 ## App Settings
@@ -89,6 +89,9 @@ app: banana
 
 `flyctl` will operate against the `banana` app unless overridden by the -a flag or other app name setting in the command line.
 
+## Releases
+`flyctl` is automatically released at 3 PM Eastern Standard Time Monday - Thursday. If needed, you can bump a release by running `./scripts/bump_version.sh`.
+
 ## Building on Windows
 
 There is a simple Powershell script, `winbuild.ps1`, which will run the code generation for the help files, format them, and run a full build, leaving a new binary in the bin directory.
@@ -98,12 +101,6 @@ There is a simple Powershell script, `winbuild.ps1`, which will run the code gen
 Run `scripts/build-dfly` to build a Docker image from the current branch. Then, use `scripts/dfly` to run it. This assumes you are already
 authenticated to Fly in your local environment.
 
-## Cutting a release
 
-If you have write access to this repo, you can ship a prerelease or full release with:
-
-`scripts/bump_version.sh prerel`
-
-or
-
-`scripts/bump_version.sh`
+## Contributing guide
+See [CONTRIBUTING.md](./CONTRIBUTING.md)

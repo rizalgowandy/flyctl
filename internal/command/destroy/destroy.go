@@ -15,11 +15,13 @@ func New() *cobra.Command {
 from the Fly platform.
 `
 		short = "Permanently destroys an app"
-		usage = "destroy [APPNAME]"
+		usage = "destroy <APPNAME>"
 	)
 
 	destroy := command.New(usage, short, long, apps.RunDestroy,
 		command.RequireSession)
+	destroy.Hidden = true
+	destroy.Deprecated = "use `fly apps destroy` instead"
 
 	destroy.Args = cobra.ExactArgs(1)
 

@@ -15,11 +15,13 @@ func New() *cobra.Command {
 organization the current user belongs to.
 `
 		short = "Move an app to another organization"
-		usage = "move [APPNAME]"
+		usage = "move <APPNAME>"
 	)
 
 	move := command.New(usage, short, long, apps.RunMove,
 		command.RequireSession)
+	move.Hidden = true
+	move.Deprecated = "use `fly apps move` instead"
 
 	move.Args = cobra.ExactArgs(1)
 

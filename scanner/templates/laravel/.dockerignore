@@ -9,9 +9,11 @@ storage/logs/*
 *.env*
 .rr.yml
 rr
+frankenphp
 vendor
 
 # 2. Ignore common files/directories we don't need
+fly.toml
 .vscode
 .idea
 **/*node_modules
@@ -23,3 +25,4 @@ vendor
 **/*.log
 **/.DS_Store
 **/Thumbs.db
+public/hot

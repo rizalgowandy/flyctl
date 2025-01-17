@@ -3,53 +3,46 @@ package flag
 
 import (
 	"context"
+	"reflect"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/superfly/flyctl/internal/flag/completion"
+	"github.com/superfly/flyctl/internal/flag/flagnames"
 )
 
-const (
-	// AccessTokenName denotes the name of the access token flag.
-	AccessTokenName = "access-token"
+type extraArgsContextKey struct{}
 
-	// VerboseName denotes the name of the verbose flag.
-	VerboseName = "verbose"
+func makeAlias[T any](template T, name string) T {
 
-	// JSONOutputName denotes the name of the json output flag.
-	JSONOutputName = "json"
+	var ret T
+	value := reflect.ValueOf(&ret).Elem()
 
-	// LocalOnlyName denotes the name of the local-only flag.
-	LocalOnlyName = "local-only"
+	descField := reflect.ValueOf(template).FieldByName("Description")
+	if descField.IsValid() {
+		value.FieldByName("Description").SetString(descField.String())
+	}
 
-	// OrgName denotes the name of the org flag.
-	OrgName = "org"
+	nameField := value.FieldByName("Name")
+	if nameField.IsValid() {
+		nameField.SetString(name)
+	}
 
-	// RegionName denotes the name of the region flag.
-	RegionName = "region"
+	hiddenField := value.FieldByName("Hidden")
+	if hiddenField.IsValid() {
+		hiddenField.SetBool(true)
+	}
 
-	// YesName denotes the name of the yes flag.
-	YesName = "yes"
+	useAliasShortHandField := reflect.ValueOf(template).FieldByName("UseAliasShortHand")
+	if useAliasShortHandField.IsValid() {
+		useAliasShortHand := useAliasShortHandField.Interface().(bool)
+		if useAliasShortHand == true {
+			value.FieldByName("Shorthand").SetString(string(name[0]))
+		}
+	}
 
-	// AppName denotes the name of the app flag.
-	AppName = "app"
-
-	// AppConfigFilePathName denotes the name of the app config file path flag.
-	AppConfigFilePathName = "config"
-
-	// ImageName denotes the name of the image flag.
-	ImageName = "image"
-
-	// NowName denotes the name of the now flag.
-	NowName = "now"
-
-	// NoDeploy denotes the name of the no deploy flag.
-	NoDeployName = "no-deploy"
-
-	// GenerateName denotes the name of the generate name flag.
-	GenerateNameFlagName = "generate-name"
-
-	// DetachName denotes the name of the detach flag.
-	DetachName = "detach"
-)
+	return ret
+}
 
 // Flag wraps the set of flags.
 type Flag interface {
@@ -78,6 +71,7 @@ type Bool struct {
 	Description string
 	Default     bool
 	Hidden      bool
+	Aliases     []string
 }
 
 func (b Bool) addTo(cmd *cobra.Command) {
@@ -91,17 +85,30 @@ func (b Bool) addTo(cmd *cobra.Command) {
 
 	f := flags.Lookup(b.Name)
 	f.Hidden = b.Hidden
+
+	// Aliases
+	for _, name := range b.Aliases {
+		makeAlias(b, name).addTo(cmd)
+	}
+	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", b.Aliases)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // String wraps the set of string flags.
 type String struct {
-	Name        string
-	Shorthand   string
-	Description string
-	Default     string
-	ConfName    string
-	EnvName     string
-	Hidden      bool
+	Name              string
+	Shorthand         string
+	Description       string
+	Default           string
+	NoOptDefVal       string
+	ConfName          string
+	EnvName           string
+	Hidden            bool
+	Aliases           []string
+	UseAliasShortHand bool
+	CompletionFn      func(ctx context.Context, cmd *cobra.Command, args []string, partial string) ([]string, error)
 }
 
 func (s String) addTo(cmd *cobra.Command) {
@@ -115,6 +122,26 @@ func (s String) addTo(cmd *cobra.Command) {
 
 	f := flags.Lookup(s.Name)
 	f.Hidden = s.Hidden
+	if s.NoOptDefVal != "" {
+		f.NoOptDefVal = s.NoOptDefVal
+	}
+
+	// Aliases
+	for _, name := range s.Aliases {
+		makeAlias(s, name).addTo(cmd)
+	}
+	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", s.Aliases)
+	if err != nil {
+		panic(err)
+	}
+
+	// Completion
+	if s.CompletionFn != nil {
+		err := cmd.RegisterFlagCompletionFunc(s.Name, completion.Adapt(s.CompletionFn))
+		if err != nil {
+			panic(err)
+		}
+	}
 }
 
 // Int wraps the set of int flags.
@@ -124,6 +151,7 @@ type Int struct {
 	Description string
 	Default     int
 	Hidden      bool
+	Aliases     []string
 }
 
 func (i Int) addTo(cmd *cobra.Command) {
@@ -137,6 +165,47 @@ func (i Int) addTo(cmd *cobra.Command) {
 
 	f := flags.Lookup(i.Name)
 	f.Hidden = i.Hidden
+
+	// Aliases
+	for _, name := range i.Aliases {
+		makeAlias(i, name).addTo(cmd)
+	}
+	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", i.Aliases)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Int wraps the set of int flags.
+type Float64 struct {
+	Name        string
+	Shorthand   string
+	Description string
+	Default     float64
+	Hidden      bool
+	Aliases     []string
+}
+
+func (i Float64) addTo(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	if i.Shorthand != "" {
+		_ = flags.Float64P(i.Name, i.Shorthand, i.Default, i.Description)
+	} else {
+		_ = flags.Float64(i.Name, i.Default, i.Description)
+	}
+
+	f := flags.Lookup(i.Name)
+	f.Hidden = i.Hidden
+
+	// Aliases
+	for _, name := range i.Aliases {
+		makeAlias(i, name).addTo(cmd)
+	}
+	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", i.Aliases)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // StringSlice wraps the set of string slice flags.
@@ -148,6 +217,7 @@ type StringSlice struct {
 	ConfName    string
 	EnvName     string
 	Hidden      bool
+	Aliases     []string
 }
 
 func (ss StringSlice) addTo(cmd *cobra.Command) {
@@ -161,48 +231,137 @@ func (ss StringSlice) addTo(cmd *cobra.Command) {
 
 	f := flags.Lookup(ss.Name)
 	f.Hidden = ss.Hidden
+
+	// Aliases
+	for _, name := range ss.Aliases {
+		makeAlias(ss, name).addTo(cmd)
+	}
+	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", ss.Aliases)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// StringArray wraps the set of string array flags.
+type StringArray struct {
+	Name        string
+	Shorthand   string
+	Description string
+	Default     []string
+	ConfName    string
+	EnvName     string
+	Hidden      bool
+	Aliases     []string
+}
+
+func (ss StringArray) addTo(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	if ss.Shorthand != "" {
+		_ = flags.StringArrayP(ss.Name, ss.Shorthand, ss.Default, ss.Description)
+	} else {
+		_ = flags.StringArray(ss.Name, ss.Default, ss.Description)
+	}
+
+	f := flags.Lookup(ss.Name)
+	f.Hidden = ss.Hidden
+
+	// Aliases
+	for _, name := range ss.Aliases {
+		makeAlias(ss, name).addTo(cmd)
+	}
+	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", ss.Aliases)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Duration wraps the set of duration flags.
+type Duration struct {
+	Name        string
+	Shorthand   string
+	Description string
+	Default     time.Duration
+	ConfName    string
+	EnvName     string
+	Hidden      bool
+	Aliases     []string
+}
+
+func (d Duration) addTo(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	if d.Shorthand != "" {
+		_ = flags.DurationP(d.Name, d.Shorthand, d.Default, d.Description)
+	} else {
+		_ = flags.Duration(d.Name, d.Default, d.Description)
+	}
+
+	f := flags.Lookup(d.Name)
+	f.Hidden = d.Hidden
+
+	// Aliases
+	for _, name := range d.Aliases {
+		makeAlias(d, name).addTo(cmd)
+	}
+	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", d.Aliases)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // Org returns an org string flag.
 func Org() String {
 	return String{
-		Name:        OrgName,
-		Description: "The organization to operate on",
-		Shorthand:   "o",
+		Name:         flagnames.Org,
+		Description:  "The target Fly.io organization",
+		Shorthand:    "o",
+		CompletionFn: completion.CompleteOrgs,
 	}
 }
 
 // Region returns a region string flag.
 func Region() String {
 	return String{
-		Name:        RegionName,
-		Description: "The region to operate on",
-		Shorthand:   "r",
+		Name:         flagnames.Region,
+		Description:  "The target region (see 'flyctl platform regions')",
+		Shorthand:    "r",
+		CompletionFn: completion.CompleteRegions,
+	}
+}
+
+func ReplicaRegions() String {
+	return String{
+		Name:         "replica-regions",
+		Description:  "Comma-separated list of regions to deploy read replicas (see 'flyctl platform regions')",
+		CompletionFn: completion.CompleteRegions,
 	}
 }
 
 // Yes returns a yes bool flag.
 func Yes() Bool {
 	return Bool{
-		Name:        YesName,
+		Name:        flagnames.Yes,
 		Shorthand:   "y",
 		Description: "Accept all confirmations",
+		Aliases:     []string{"auto-confirm"},
 	}
 }
 
 // App returns an app string flag.
 func App() String {
 	return String{
-		Name:        AppName,
-		Shorthand:   "a",
-		Description: "Application name",
+		Name:         flagnames.App,
+		Shorthand:    "a",
+		Description:  "Application name",
+		CompletionFn: completion.CompleteApps,
 	}
 }
 
 // AppConfig returns an app config string flag.
 func AppConfig() String {
 	return String{
-		Name:        AppConfigFilePathName,
+		Name:        flagnames.AppConfigFilePath,
 		Shorthand:   "c",
 		Description: "Path to application configuration file",
 	}
@@ -211,25 +370,32 @@ func AppConfig() String {
 // Image returns a Docker image config string flag.
 func Image() String {
 	return String{
-		Name:        ImageName,
+		Name:        flagnames.Image,
 		Shorthand:   "i",
-		Description: "The image tag or ID to deploy",
+		Description: "The Docker image to deploy",
 	}
 }
 
 // Now returns a boolean flag for deploying immediately
 func Now() Bool {
 	return Bool{
-		Name:        NowName,
+		Name:        flagnames.Now,
 		Description: "Deploy now without confirmation",
 		Default:     false,
+	}
+}
+
+func NoDeploy() Bool {
+	return Bool{
+		Name:        "no-deploy",
+		Description: "Do not immediately deploy the new app after fly launch creates and configures it",
 	}
 }
 
 // GenerateName returns a boolean flag for generating an application name
 func GenerateName() Bool {
 	return Bool{
-		Name:        GenerateNameFlagName,
+		Name:        flagnames.GenerateNameFlag,
 		Description: "Always generate a name for the app",
 		Default:     false,
 	}
@@ -241,7 +407,7 @@ const remoteOnlyName = "remote-only"
 func RemoteOnly(defaultValue bool) Bool {
 	return Bool{
 		Name:        remoteOnlyName,
-		Description: "Perform builds on a remote builder instance instead of using the local docker daemon",
+		Description: "Perform builds on a remote builder instance instead of using the local docker daemon. This is the default. Use --local-only to build locally.",
 		Default:     defaultValue,
 	}
 }
@@ -250,13 +416,43 @@ func GetRemoteOnly(ctx context.Context) bool {
 	return GetBool(ctx, remoteOnlyName)
 }
 
+const wireguard = "wg"
+
+// Wireguard returns a boolean flag indicating whether to build over wireguard or not
+func Wireguard() Bool {
+	return Bool{
+		Name:        wireguard,
+		Description: "Determines whether communication with remote builders are conducted over wireguard or plain internet(https)",
+		Default:     true,
+	}
+}
+
+func GetWireguard(ctx context.Context) bool {
+	return GetBool(ctx, wireguard)
+}
+
+const httpsFailover = "https-failover"
+
+func HttpsFailover() Bool {
+	return Bool{
+		Name:        httpsFailover,
+		Description: "Determines whether to failover to plain internet(https) communication with remote builders if wireguard fails",
+		Aliases:     []string{"http-failover"},
+		Default:     true,
+	}
+}
+
+func GetHTTPSFailover(ctx context.Context) bool {
+	return GetBool(ctx, httpsFailover)
+}
+
 const localOnlyName = "local-only"
 
 // RemoteOnly returns a boolean flag for deploying remotely
 func LocalOnly() Bool {
 	return Bool{
 		Name:        localOnlyName,
-		Description: "Only perform builds locally using the local docker daemon",
+		Description: "Perform builds locally using the local docker daemon. The default is --remote-only.",
 	}
 }
 
@@ -312,6 +508,15 @@ func Dockerfile() String {
 	}
 }
 
+const ignorefileName = "ignorefile"
+
+func Ignorefile() String {
+	return String{
+		Name:        ignorefileName,
+		Description: "Path to a Docker ignore file. Defaults to the .dockerignore file in the working directory.",
+	}
+}
+
 func ImageLabel() String {
 	return String{
 		Name:        "image-label",
@@ -326,15 +531,15 @@ func NoCache() Bool {
 	}
 }
 
-func BuildSecret() StringSlice {
-	return StringSlice{
+func BuildSecret() StringArray {
+	return StringArray{
 		Name:        "build-secret",
-		Description: "Set of build secrets of NAME=VALUE pairs. Can be specified multiple times. See https://docs.docker.com/develop/develop-images/build_enhancements/#new-docker-build-secret-information",
+		Description: "Set of build secrets of NAME=VALUE pairs. Can be specified multiple times. See https://docs.docker.com/engine/reference/commandline/buildx_build/#secret",
 	}
 }
 
-func BuildArg() StringSlice {
-	return StringSlice{
+func BuildArg() StringArray {
+	return StringArray{
 		Name:        "build-arg",
 		Description: "Set of build time variables in the form of NAME=VALUE pairs. Can be specified multiple times.",
 	}
@@ -347,17 +552,122 @@ func BuildTarget() String {
 	}
 }
 
+func Depot() String {
+	return String{
+		Name:        "depot",
+		Default:     "auto",
+		NoOptDefVal: "true",
+		Description: "Deploy using depot to build the image",
+	}
+}
+
+func DepotScope() String {
+	return String{
+		Name:        "depot-scope",
+		Description: "The scope of the Depot builder's cache to use (org or app)",
+		Default:     "org",
+	}
+}
+
 func Nixpacks() Bool {
 	return Bool{
 		Name:        "nixpacks",
-		Description: "Deploy using nixpacks to generate the image",
 		Default:     false,
+		Description: "Deploy using nixpacks to build the image",
 	}
 }
 
 func Strategy() String {
 	return String{
 		Name:        "strategy",
-		Description: "The strategy for replacing running instances. Options are canary, rolling, bluegreen, or immediate. Default is canary, or rolling when max-per-region is set.",
+		Description: "The strategy for replacing running instances. Options are canary, rolling, bluegreen, or immediate. The default strategy is rolling.",
+	}
+}
+
+func JSONOutput() Bool {
+	return Bool{
+		Name:        flagnames.JSONOutput,
+		Shorthand:   "j",
+		Description: "JSON output",
+		Default:     false,
+	}
+}
+
+func ProcessGroup(desc string) String {
+	if desc == "" {
+		desc = "The target process group"
+	}
+
+	return String{
+		Name:        flagnames.ProcessGroup,
+		Description: desc,
+		Shorthand:   "g",
+		Aliases:     []string{"group"},
+	}
+}
+
+// BuildpacksDockerHost address to docker daemon that will be exposed to the buildpacks build container
+const BuildpacksDockerHost = "buildpacks-docker-host"
+
+func BpDockerHost() String {
+	return String{
+		Name: BuildpacksDockerHost,
+		Description: `Address to docker daemon that will be exposed to the build container.
+If not set (or set to empty string) the standard socket location will be used.
+Special value 'inherit' may be used in which case DOCKER_HOST environment variable will be used.
+This option may set DOCKER_HOST environment variable for the build container if needed.
+`,
+	}
+}
+
+func RecreateBuilder() Bool {
+	return Bool{
+		Name:        "recreate-builder",
+		Description: "Recreate the builder app, if it exists",
+		Default:     false,
+	}
+}
+
+func GetRecreateBuilder(ctx context.Context) bool {
+	return GetBool(ctx, "recreate-builder")
+}
+
+// BuildpacksVolume the host volume that will be mounted to the buildpacks build container
+const BuildpacksVolume = "buildpacks-volume"
+
+func BpVolume() StringSlice {
+	return StringSlice{
+		Name: BuildpacksVolume,
+		Description: `Mount host volume into the build container, in the form '<host path>:<target path>[:<options>]'.
+- 'host path': Name of the volume or absolute directory path to mount.
+- 'target path': The path where the file or directory is available in the container.
+- 'options' (default "ro"): An optional comma separated list of mount options.
+    - "ro", volume contents are read-only.
+    - "rw", volume contents are readable and writeable.
+    - "volume-opt=<key>=<value>", can be specified more than once, takes a key-value pair consisting of the option name and its value.
+Repeat for each volume in order (comma-separated lists not accepted)
+`,
+	}
+}
+
+// WithExtraArgs derives a context that carries extraArgs from ctx.
+func WithExtraArgs(ctx context.Context, extraArgs []string) context.Context {
+	return context.WithValue(ctx, extraArgsContextKey{}, extraArgs)
+}
+
+// ExtraArgsFromContext returns the extraArgs ctx carries.
+func ExtraArgsFromContext(ctx context.Context) []string {
+	if extraArgs, ok := ctx.Value(extraArgsContextKey{}).([]string); ok {
+		return extraArgs
+	}
+
+	return []string{}
+}
+
+func Env() StringArray {
+	return StringArray{
+		Name:        "env",
+		Shorthand:   "e",
+		Description: "Set of environment variables in the form of NAME=VALUE pairs. Can be specified multiple times.",
 	}
 }

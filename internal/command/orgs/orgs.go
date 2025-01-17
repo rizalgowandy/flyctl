@@ -7,12 +7,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/superfly/flyctl/api"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/iostreams"
 
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/prompt"
 	"github.com/superfly/flyctl/internal/sort"
 )
@@ -61,9 +61,13 @@ func emailFromSecondArgOrPrompt(ctx context.Context) (email string, err error) {
 
 var errSlugArgMustBeSpecified = prompt.NonInteractiveError("slug argument must be specified when not running interactively")
 
-func slugFromFirstArgOrSelect(ctx context.Context) (slug string, err error) {
-	if slug = flag.FirstArg(ctx); slug != "" {
-		return
+func slugFromArgOrSelect(ctx context.Context, orgSlug string, filters ...fly.OrganizationFilter) (slug string, err error) {
+	if orgSlug != "" {
+		return orgSlug, nil
+	}
+
+	if args := flag.Args(ctx); len(args) > 0 {
+		return args[0], nil
 	}
 
 	io := iostreams.FromContext(ctx)
@@ -73,26 +77,39 @@ func slugFromFirstArgOrSelect(ctx context.Context) (slug string, err error) {
 		return
 	}
 
-	client := client.FromContext(ctx).API()
+	client := flyutil.ClientFromContext(ctx)
 
-	var orgs []api.Organization
-	if orgs, err = client.GetOrganizations(ctx); err != nil {
+	var orgs []fly.Organization
+	if orgs, err = client.GetOrganizations(ctx, filters...); err != nil {
 		return
 	}
 	sort.OrganizationsByTypeAndName(orgs)
 
-	var org *api.Organization
+	var org *fly.Organization
 	if org, err = prompt.SelectOrg(ctx, orgs); prompt.IsNonInteractive(err) {
 		err = errSlugArgMustBeSpecified
-	} else {
+	} else if err == nil {
 		slug = org.Slug
 	}
 
 	return
 }
 
-func OrgFromFirstArgOrSelect(ctx context.Context) (*api.Organization, error) {
-	slug, err := slugFromFirstArgOrSelect(ctx)
+func OrgFromEnvVarOrFirstArgOrSelect(ctx context.Context, filters ...fly.OrganizationFilter) (*fly.Organization, error) {
+	slug := flag.GetOrg(ctx)
+	if slug == "" {
+		var err error
+		slug, err = slugFromArgOrSelect(ctx, slug, filters...)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return OrgFromSlug(ctx, slug)
+}
+
+func OrgFromFlagOrSelect(ctx context.Context, filters ...fly.OrganizationFilter) (*fly.Organization, error) {
+	slug, err := slugFromArgOrSelect(ctx, flag.GetOrg(ctx), filters...)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +117,8 @@ func OrgFromFirstArgOrSelect(ctx context.Context) (*api.Organization, error) {
 	return OrgFromSlug(ctx, slug)
 }
 
-func OrgFromSlug(ctx context.Context, slug string) (*api.Organization, error) {
-	client := client.FromContext(ctx).API()
+func OrgFromSlug(ctx context.Context, slug string) (*fly.Organization, error) {
+	client := flyutil.ClientFromContext(ctx)
 
 	org, err := client.GetOrganizationBySlug(ctx, slug)
 	if err != nil {
@@ -111,7 +128,7 @@ func OrgFromSlug(ctx context.Context, slug string) (*api.Organization, error) {
 	return org, nil
 }
 
-func printOrg(w io.Writer, org *api.Organization, headers bool) {
+func printOrg(w io.Writer, org *fly.Organization, headers bool) {
 	if headers {
 		fmt.Fprintf(w, "%-20s %-20s %-10s\n", "Name", "Slug", "Type")
 		fmt.Fprintf(w, "%-20s %-20s %-10s\n", "----", "----", "----")

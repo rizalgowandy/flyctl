@@ -13,6 +13,7 @@ import (
 	"github.com/azazeal/pause"
 
 	"github.com/superfly/flyctl/flyctl"
+	"github.com/superfly/flyctl/internal/config"
 	"github.com/superfly/flyctl/internal/filemu"
 	"github.com/superfly/flyctl/internal/logger"
 	"github.com/superfly/flyctl/internal/sentry"
@@ -34,13 +35,27 @@ func StartDaemon(ctx context.Context) (*Client, error) {
 		return nil, err
 	}
 
-	cmd := exec.Command(os.Args[0], "agent", "run", logFile)
-	cmd.Env = append(os.Environ(), "FLY_NO_UPDATE_CHECK=1")
-	setSysProcAttributes(cmd)
+	flyctl, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(flyctl, "agent", "run", logFile)
+
+	env := os.Environ()
+	env = append(env, "FLY_NO_UPDATE_CHECK=1")
+
+	// if our tokens came from the config file, let agent get them there too
+	if toks := config.Tokens(ctx); toks.FromFile() == "" {
+		env = append(env, fmt.Sprintf("FLY_API_TOKEN=%s", config.Tokens(ctx).All()))
+	}
+
+	cmd.Env = env
+
+	SetSysProcAttributes(cmd)
 
 	if err := cmd.Start(); err != nil {
 		err = forkError{err}
-		sentry.CaptureException(err)
+		sentry.CaptureException(err, sentry.WithTraceID(ctx))
 
 		return nil, fmt.Errorf("failed starting agent process: %w", err)
 	}
@@ -64,9 +79,9 @@ func StartDaemon(ctx context.Context) (*Client, error) {
 		}
 
 		if log != "" {
-			sentry.CaptureException(err, sentry.WithExtra("log", log))
+			sentry.CaptureException(err, sentry.WithExtra("log", log), sentry.WithTraceID(ctx))
 		} else {
-			sentry.CaptureException(err)
+			sentry.CaptureException(err, sentry.WithTraceID(ctx))
 		}
 
 		return nil, err
@@ -81,10 +96,12 @@ func (alreadyStartingError) Error() string {
 	return "another process is already starting the agent"
 }
 
-var lockPath = filepath.Join(os.TempDir(), "flyctl.agent.start.lock")
+func lockPath() string {
+	return filepath.Join(flyctl.ConfigDir(), "flyctl.agent.start.lock")
+}
 
 func lock(ctx context.Context) (unlock filemu.UnlockFunc, err error) {
-	switch unlock, err = filemu.Lock(ctx, lockPath); {
+	switch unlock, err = filemu.Lock(ctx, lockPath()); {
 	case err == nil:
 		break // all done
 	case ctx.Err() != nil:

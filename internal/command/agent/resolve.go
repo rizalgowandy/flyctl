@@ -28,6 +28,7 @@ func newResolve() (cmd *cobra.Command) {
 
 	cmd.Args = cobra.ExactArgs(2)
 
+	flag.Add(cmd, flag.JSONOutput())
 	return
 }
 
@@ -43,7 +44,7 @@ func runResolve(ctx context.Context) (err error) {
 		hostport = args[1]
 	)
 
-	addr, err := client.Resolve(ctx, slug, hostport)
+	addr, err := client.Resolve(ctx, slug, hostport, "")
 	if err != nil {
 		return
 	}
